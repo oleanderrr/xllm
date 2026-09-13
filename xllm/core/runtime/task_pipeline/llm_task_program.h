@@ -28,6 +28,7 @@ namespace xllm {
 // storage and an LM-head warmup are completed before KV budgeting; KV may be
 // populated afterwards.
 struct LlmTaskCapacity {
+  uint32_t slot_count = 1;
   ModelInputCapacity model;
   uint32_t max_kv_seq_len = 0;
   uint32_t max_positions = 0;
@@ -48,9 +49,11 @@ struct LlmTaskInput {
   SamplingParameters sampling;
 };
 
-// One ordinary LLM Slot. Prepare/Consume use the state executor; launch uses
-// the dedicated thread, with exclusive ownership transferred by the pipeline.
-// The model, executor and KV vector outlive this object and all of its readers.
+// One ordinary LLM program with private storage for each admitted Slot.
+// Slots share streams, the original model/Executor and sampler workspace.
+// The owner retires each Slot before reuse and serializes all Launch calls;
+// Prepare and Consume may run beside Launch for a different Slot.
+// The model, executor and KV vector outlive every Slot and its readers.
 class LlmTaskProgram final {
  public:
   static Status create(CausalLM& model,
@@ -62,21 +65,37 @@ class LlmTaskProgram final {
   LlmTaskProgram(const LlmTaskProgram&) = delete;
   LlmTaskProgram& operator=(const LlmTaskProgram&) = delete;
 
-  Status prepare(const LlmTaskInput& input);
-  void launch();
-  TokenResultTensors consume();
-  void discard();
+  Status prepare(uint32_t slot_id, const LlmTaskInput& input);
+  void launch(uint32_t slot_id);
+  TokenResultTensors consume(uint32_t slot_id);
+  void discard(uint32_t slot_id);
+  uint32_t slot_count() const { return capacity_.slot_count; }
+  uint64_t shared_device_bytes() const { return sampler_->device_bytes(); }
+  uint64_t slot_device_bytes(uint32_t slot_id) const;
+  uint64_t slot_pinned_bytes(uint32_t slot_id) const;
   uint64_t pinned_bytes() const;
   uint64_t device_bytes() const;
 
  private:
+  struct Slot {
+    StreamEventPtr input_ready;
+    StreamEventPtr output_ready;
+    std::unique_ptr<ModelInputStorage> storage;
+    std::unique_ptr<ModelInputBinding> model_input;
+    std::unique_ptr<SamplingInputBinding> sampling_input;
+    std::unique_ptr<TokenResultStorage> result;
+    std::unique_ptr<PreparedSamplingInvocation> sampling;
+    ModelOutput model_output;
+    torch::Tensor logits;
+  };
+
   LlmTaskProgram(CausalLM& model,
                  Executor& executor,
                  std::vector<KVCache>& kv_caches,
                  LlmTaskCapacity capacity,
                  torch::Device device);
-  Status validate(const LlmTaskInput& input) const;
-  void release_outputs();
+  Status validate(const Slot& slot, const LlmTaskInput& input) const;
+  void release_outputs(Slot& slot);
 
   CausalLM& model_;
   Executor& executor_;
@@ -86,16 +105,8 @@ class LlmTaskProgram final {
   Stream prepare_stream_;
   Stream task_stream_;
   Stream result_stream_;
-  StreamEventPtr input_ready_;
-  StreamEventPtr output_ready_;
-  std::unique_ptr<ModelInputStorage> storage_;
-  std::unique_ptr<ModelInputBinding> model_input_;
-  std::unique_ptr<SamplingInputBinding> sampling_input_;
   std::unique_ptr<PreparedSampler> sampler_;
-  std::unique_ptr<TokenResultStorage> result_;
-  std::unique_ptr<PreparedSamplingInvocation> sampling_;
-  ModelOutput model_output_;
-  torch::Tensor logits_;
+  std::vector<std::unique_ptr<Slot>> slots_;
 };
 
 }  // namespace xllm

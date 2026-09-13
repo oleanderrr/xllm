@@ -79,7 +79,8 @@ Status LlmTaskProgram::create(CausalLM& model,
     return invalid(
         "LLM task pipeline requires supported Python prepared metadata.");
   }
-  if (model.device().type() != torch::kPrivateUse1 ||
+  if (capacity.slot_count == 0 || capacity.slot_count > 2 ||
+      model.device().type() != torch::kPrivateUse1 ||
       !model.device().has_index() || capacity.max_kv_seq_len == 0 ||
       capacity.max_positions == 0 || capacity.block_size == 0 ||
       capacity.hidden_size == 0 ||
@@ -92,24 +93,35 @@ Status LlmTaskProgram::create(CausalLM& model,
   c10::DeviceGuard guard(model.device());
   auto program = std::unique_ptr<LlmTaskProgram>(
       new LlmTaskProgram(model, executor, kv_caches, capacity, model.device()));
-  Status status = ModelInputStorage::create(
-      capacity.model, model.device(), program->storage_);
-  if (!status.ok()) {
-    return status;
-  }
-  program->model_input_ =
-      std::make_unique<ModelInputBinding>(*program->storage_);
   const uint32_t rows = capacity.model.max_sequences;
-  status = SamplingInputBinding::create({rows,
-                                         rows,
-                                         capacity.max_unique_tokens,
-                                         capacity.vocab_size,
-                                         capacity.max_top_logprobs},
-                                        model.device(),
-                                        capacity.parameter_dtype,
-                                        program->sampling_input_);
-  if (!status.ok()) {
-    return status;
+  program->slots_.reserve(capacity.slot_count);
+  for (uint32_t slot_id = 0; slot_id < capacity.slot_count; ++slot_id) {
+    auto slot = std::make_unique<Slot>();
+    Status status = ModelInputStorage::create(
+        capacity.model, model.device(), slot->storage);
+    if (!status.ok()) {
+      return status;
+    }
+    slot->model_input = std::make_unique<ModelInputBinding>(*slot->storage);
+    status = SamplingInputBinding::create({rows,
+                                           rows,
+                                           capacity.max_unique_tokens,
+                                           capacity.vocab_size,
+                                           capacity.max_top_logprobs},
+                                          model.device(),
+                                          capacity.parameter_dtype,
+                                          slot->sampling_input);
+    if (!status.ok()) {
+      return status;
+    }
+    status = TokenResultStorage::create(
+        {rows, 1, capacity.max_top_logprobs}, model.device(), slot->result);
+    if (!status.ok()) {
+      return status;
+    }
+    slot->input_ready = reusable_event();
+    slot->output_ready = reusable_event();
+    program->slots_.emplace_back(std::move(slot));
   }
   // Resolve the actual loaded LM head's output contract during initialization.
   // A single deterministic row needs no KV, consumes no RNG and never occurs
@@ -131,7 +143,7 @@ Status LlmTaskProgram::create(CausalLM& model,
             << " row_stride=" << logits.stride(/*dim=*/0);
   Stream warmup(c10_npu::getCurrentNPUStream(model.device().index()));
   CHECK_EQ(warmup.synchronize(), 0);
-  status = PreparedSampler::create(
+  Status status = PreparedSampler::create(
       {{rows, rows, capacity.max_unique_tokens, capacity.vocab_size},
        capacity.max_top_logprobs,
        static_cast<uint32_t>(logits.stride(/*dim=*/0))},
@@ -142,13 +154,6 @@ Status LlmTaskProgram::create(CausalLM& model,
   if (!status.ok()) {
     return status;
   }
-  status = TokenResultStorage::create(
-      {rows, 1, capacity.max_top_logprobs}, model.device(), program->result_);
-  if (!status.ok()) {
-    return status;
-  }
-  program->input_ready_ = reusable_event();
-  program->output_ready_ = reusable_event();
   // Initialization is outside serving. Complete allocation-stream writes
   // before handing storage and native plans to either execution thread.
   Stream initialization(c10_npu::getCurrentNPUStream(model.device().index()));
@@ -157,13 +162,14 @@ Status LlmTaskProgram::create(CausalLM& model,
   return Status();
 }
 
-Status LlmTaskProgram::validate(const LlmTaskInput& input) const {
-  Status status = model_input_->validate(input.model, input.batch);
+Status LlmTaskProgram::validate(const Slot& slot,
+                                const LlmTaskInput& input) const {
+  Status status = slot.model_input->validate(input.model, input.batch);
   if (!status.ok()) {
     return status;
   }
-  status =
-      sampling_input_->validate(input.sampling, input.model.token_ids.size());
+  status = slot.sampling_input->validate(input.sampling,
+                                         input.model.token_ids.size());
   if (!status.ok()) {
     return status;
   }
@@ -218,91 +224,123 @@ Status LlmTaskProgram::validate(const LlmTaskInput& input) const {
   return Status();
 }
 
-Status LlmTaskProgram::prepare(const LlmTaskInput& input) {
-  Status status = validate(input);
+Status LlmTaskProgram::prepare(uint32_t slot_id, const LlmTaskInput& input) {
+  if (slot_id >= slots_.size()) {
+    return invalid("Invalid LLM Slot index.");
+  }
+  Slot& slot = *slots_[slot_id];
+  Status status = validate(slot, input);
   if (!status.ok()) {
     return status;
   }
   c10::DeviceGuard guard(device_);
   // All expected admission failures precede any Slot or Device writes.
-  status = model_input_->prepare(input.model, input.batch, prepare_stream_);
+  status = slot.model_input->prepare(input.model, input.batch, prepare_stream_);
   CHECK(status.ok()) << status.message();
-  status = sampling_input_->prepare(
+  status = slot.sampling_input->prepare(
       input.sampling, input.model.token_ids.size(), prepare_stream_);
   CHECK(status.ok()) << status.message();
   if (!input.model.token_ids.empty()) {
-    executor_.prepare_attention_metadata(kv_caches_, model_input_->params());
+    executor_.prepare_attention_metadata(kv_caches_,
+                                         slot.model_input->params());
   }
-  const auto& params = sampling_input_->params();
+  const auto& params = slot.sampling_input->params();
   const uint32_t samples =
       params.sample_idxes.defined() ? params.sample_idxes.numel() : 0;
-  status = result_->bind(
+  status = slot.result->bind(
       {samples,
        samples == 0 ? 0U : 1U,
        params.logprobs ? static_cast<uint32_t>(params.max_top_logprobs) : 0U,
        params.logprobs});
   CHECK(status.ok()) << status.message();
   status = sampler_->bind(params,
-                          final_views(result_->device()),
-                          result_->device().lengths,
-                          sampling_);
+                          final_views(slot.result->device()),
+                          slot.result->device().lengths,
+                          slot.sampling);
   CHECK(status.ok()) << status.message();
-  record(prepare_stream_, input_ready_);
+  record(prepare_stream_, slot.input_ready);
   return Status();
 }
 
-void LlmTaskProgram::launch() {
+void LlmTaskProgram::launch(uint32_t slot_id) {
+  CHECK_LT(slot_id, slots_.size());
+  Slot& slot = *slots_[slot_id];
   c10::DeviceGuard device_guard(device_);
   auto guard = task_stream_.set_stream_guard();
   CHECK_EQ(aclrtStreamWaitEvent(task_stream_.get_stream()->stream(),
-                                input_ready_->npu_event()),
+                                slot.input_ready->npu_event()),
            ACL_SUCCESS)
       << "Failed to wait for LLM task input.";
-  if (model_input_->tokens().numel() != 0) {
-    model_output_ = executor_.forward(model_input_->tokens(),
-                                      model_input_->positions(),
-                                      kv_caches_,
-                                      model_input_->params());
+  if (slot.model_input->tokens().numel() != 0) {
+    slot.model_output = executor_.forward(slot.model_input->tokens(),
+                                          slot.model_input->positions(),
+                                          kv_caches_,
+                                          slot.model_input->params());
   }
-  const auto& params = sampling_input_->params();
+  const auto& params = slot.sampling_input->params();
   if (params.selected_token_idxes.defined() &&
       params.selected_token_idxes.numel() != 0) {
-    logits_ =
-        model_.logits(model_output_.hidden_states, params.selected_token_idxes);
-    sampling_->run(logits_);
+    slot.logits = model_.logits(slot.model_output.hidden_states,
+                                params.selected_token_idxes);
+    slot.sampling->run(slot.logits);
   }
-  record(task_stream_, output_ready_);
-  const Status status = result_->copy_to_host(result_stream_, output_ready_);
+  record(task_stream_, slot.output_ready);
+  const Status status =
+      slot.result->copy_to_host(result_stream_, slot.output_ready);
   CHECK(status.ok()) << status.message();
 }
 
-TokenResultTensors LlmTaskProgram::consume() {
+TokenResultTensors LlmTaskProgram::consume(uint32_t slot_id) {
+  CHECK_LT(slot_id, slots_.size());
+  Slot& slot = *slots_[slot_id];
   c10::DeviceGuard guard(device_);
-  TokenResultTensors result = result_->take_result();
-  release_outputs();
+  TokenResultTensors result = slot.result->take_result();
+  release_outputs(slot);
   return result;
 }
 
-void LlmTaskProgram::discard() {
+void LlmTaskProgram::discard(uint32_t slot_id) {
+  CHECK_LT(slot_id, slots_.size());
+  Slot& slot = *slots_[slot_id];
   c10::DeviceGuard guard(device_);
-  result_->discard_result();
-  release_outputs();
+  slot.result->discard_result();
+  release_outputs(slot);
 }
 
-void LlmTaskProgram::release_outputs() {
-  logits_ = torch::Tensor();
-  model_output_ = ModelOutput();
-  sampling_.reset();
+void LlmTaskProgram::release_outputs(Slot& slot) {
+  slot.logits = torch::Tensor();
+  slot.model_output = ModelOutput();
+  slot.sampling.reset();
+}
+
+uint64_t LlmTaskProgram::slot_pinned_bytes(uint32_t slot_id) const {
+  CHECK_LT(slot_id, slots_.size());
+  const Slot& slot = *slots_[slot_id];
+  return slot.storage->host_buffer().nbytes() +
+         slot.sampling_input->pinned_bytes() + slot.result->pinned_bytes();
+}
+
+uint64_t LlmTaskProgram::slot_device_bytes(uint32_t slot_id) const {
+  CHECK_LT(slot_id, slots_.size());
+  const Slot& slot = *slots_[slot_id];
+  return slot.storage->device_buffer().nbytes() +
+         slot.sampling_input->device_bytes() + slot.result->device_bytes();
 }
 
 uint64_t LlmTaskProgram::pinned_bytes() const {
-  return storage_->host_buffer().nbytes() + sampling_input_->pinned_bytes() +
-         result_->pinned_bytes();
+  uint64_t bytes = 0;
+  for (uint32_t slot_id = 0; slot_id < slots_.size(); ++slot_id) {
+    bytes += slot_pinned_bytes(slot_id);
+  }
+  return bytes;
 }
 
 uint64_t LlmTaskProgram::device_bytes() const {
-  return storage_->device_buffer().nbytes() + sampling_input_->device_bytes() +
-         sampler_->device_bytes() + result_->device_bytes();
+  uint64_t bytes = shared_device_bytes();
+  for (uint32_t slot_id = 0; slot_id < slots_.size(); ++slot_id) {
+    bytes += slot_device_bytes(slot_id);
+  }
+  return bytes;
 }
 
 }  // namespace xllm

@@ -271,11 +271,12 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     }
   }
 
-  std::unique_ptr<TaskExecutionPipeline> make_pipeline(
-      ThreadPool& state,
+  std::unique_ptr<LlmTaskProgram> make_program(
+      uint32_t slot_count = 1,
       torch::ScalarType parameter_dtype = torch::kBFloat16) {
     auto rng_before = pipeline_rng_state();
     LlmTaskCapacity capacity;
+    capacity.slot_count = slot_count;
     capacity.model = {32, 3, 2};
     capacity.max_kv_seq_len = 128;
     capacity.max_positions = 128;
@@ -293,10 +294,21 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     if (!status.ok()) {
       return nullptr;
     }
-    std::unique_ptr<TaskExecutionPipeline> pipeline;
-    status = TaskExecutionPipeline::create(state, std::move(program), pipeline);
-    EXPECT_TRUE(status.ok()) << status.message();
     EXPECT_TRUE(torch::equal(rng_before, pipeline_rng_state()));
+    return program;
+  }
+
+  std::unique_ptr<TaskExecutionPipeline> make_pipeline(
+      ThreadPool& state,
+      torch::ScalarType parameter_dtype = torch::kBFloat16) {
+    auto program = make_program(/*slot_count=*/1, parameter_dtype);
+    if (program == nullptr) {
+      return nullptr;
+    }
+    std::unique_ptr<TaskExecutionPipeline> pipeline;
+    const Status status =
+        TaskExecutionPipeline::create(state, std::move(program), pipeline);
+    EXPECT_TRUE(status.ok()) << status.message();
     return pipeline;
   }
 
@@ -496,6 +508,99 @@ TEST_P(Qwen3SlotForwardTest, PipelinePrefillDecodeSamplingAndInputOwnership) {
     EXPECT_TRUE(torch::equal(retained[index].tokens, snapshots[index]));
   }
   compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, TwoSlotsShareWorkspaceAndKeepPrivateInputs) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    auto single = make_program(/*slot_count=*/1, parameter_dtype);
+    ASSERT_NE(single, nullptr);
+    const uint64_t shared_bytes = single->shared_device_bytes();
+    const uint64_t private_bytes = single->slot_device_bytes(/*slot_id=*/0);
+    const uint64_t pinned_bytes = single->pinned_bytes();
+    single.reset();
+    auto program = make_program(/*slot_count=*/2, parameter_dtype);
+    ASSERT_NE(program, nullptr);
+    EXPECT_EQ(program->slot_count(), 2);
+    EXPECT_GT(shared_bytes, 0);
+    EXPECT_EQ(program->shared_device_bytes(), shared_bytes);
+    EXPECT_EQ(program->device_bytes(), shared_bytes + 2 * private_bytes);
+    EXPECT_EQ(program->pinned_bytes(), 2 * pinned_bytes);
+    EXPECT_EQ(program->slot_device_bytes(/*slot_id=*/1), private_bytes);
+    std::vector<TokenResultTensors> retained;
+    std::vector<SampleOutput> snapshots;
+    retained.reserve(/*new_cap=*/12);
+    snapshots.reserve(/*new_cap=*/12);
+    for (int32_t pair = 0; pair < 6; ++pair) {
+      SCOPED_TRACE(pair);
+      auto first = make_batch({5, 3}, {5, 3});
+      auto second = make_batch({1, 1}, {6, 4});
+      auto first_params = sampling_for(first, pair % 3);
+      auto second_params = sampling_for(second, pair % 3);
+      auto rng_before = pipeline_rng_state();
+      auto expected_first = reference(
+          first, BatchForwardType::PREFILL, first_params, parameter_dtype);
+      auto expected_second = reference(
+          second, BatchForwardType::DECODE, second_params, parameter_dtype);
+      auto expected_rng = pipeline_rng_state();
+      restore_pipeline_rng(rng_before);
+      ASSERT_TRUE(
+          program
+              ->prepare(
+                  /*slot_id=*/0,
+                  {view(first), {BatchForwardType::PREFILL, 2}, first_params})
+              .ok());
+      ASSERT_TRUE(
+          program
+              ->prepare(
+                  /*slot_id=*/1,
+                  {view(second), {BatchForwardType::DECODE, 2}, second_params})
+              .ok());
+      EXPECT_EQ(program->prepare(/*slot_id=*/2, {}).code(),
+                StatusCode::INVALID_ARGUMENT);
+      EXPECT_TRUE(torch::equal(rng_before, pipeline_rng_state()));
+      // Both Slots are prepared before either is launched. Mutating both
+      // caller inputs must affect neither Slot's metadata nor its sampling.
+      first.tokens.assign(first.tokens.size(), /*value=*/-99);
+      second.tokens.assign(second.tokens.size(), /*value=*/-99);
+      for (BatchData* batch : {&first, &second}) {
+        std::fill(
+            batch->positions.begin(), batch->positions.end(), /*value=*/-99);
+        std::fill(batch->q.begin(), batch->q.end(), /*value=*/0);
+        std::fill(batch->kv.begin(), batch->kv.end(), /*value=*/0);
+        std::fill(
+            batch->cumulative.begin(), batch->cumulative.end(), /*value=*/0);
+        std::fill(batch->blocks.begin(), batch->blocks.end(), /*value=*/-99);
+      }
+      for (SamplingParameters* params : {&first_params, &second_params}) {
+        params->selected_token_idxes.fill_(/*value=*/-99);
+        params->unique_token_counts.fill_(/*value=*/99);
+        params->do_sample.logical_not_();
+      }
+      first_params.top_p.zero_();
+      second_params.top_p.zero_();
+      std::thread launch([&program] {
+        program->launch(/*slot_id=*/0);
+        program->launch(/*slot_id=*/1);
+      });
+      launch.join();
+      auto first_result = program->consume(/*slot_id=*/0);
+      auto second_result = program->consume(/*slot_id=*/1);
+      compare_result({Status(), first_result}, expected_first);
+      compare_result({Status(), second_result}, expected_second);
+      EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+      snapshots.emplace_back(std::move(expected_first));
+      snapshots.emplace_back(std::move(expected_second));
+      retained.emplace_back(std::move(first_result));
+      retained.emplace_back(std::move(second_result));
+    }
+    program.reset();
+    for (uint32_t index = 0; index < retained.size(); ++index) {
+      compare_result({Status(), retained[index]}, snapshots[index]);
+    }
+    compare_kv();
+  }
 }
 
 TEST_P(Qwen3SlotForwardTest, PipelineRejectsBeforeWritesAndReusesSlot) {

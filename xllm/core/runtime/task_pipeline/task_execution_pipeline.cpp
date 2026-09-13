@@ -23,10 +23,10 @@ Status TaskExecutionPipeline::create(
     ThreadPool& state_executor,
     std::unique_ptr<LlmTaskProgram> program,
     std::unique_ptr<TaskExecutionPipeline>& output) {
-  if (state_executor.size() != 1 || program == nullptr) {
-    return Status(
-        StatusCode::INVALID_ARGUMENT,
-        "Task pipeline requires one state thread and an LLM program.");
+  if (state_executor.size() != 1 || program == nullptr ||
+      program->slot_count() != 1) {
+    return Status(StatusCode::INVALID_ARGUMENT,
+                  "Task pipeline requires one state thread and one LLM Slot.");
   }
   output = std::unique_ptr<TaskExecutionPipeline>(
       new TaskExecutionPipeline(state_executor, std::move(program)));
@@ -64,7 +64,7 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmTaskInput& input) {
               0});
           return;
         }
-        Status status = program_->prepare(input);
+        Status status = program_->prepare(/*slot_id=*/0, input);
         if (!status.ok()) {
           promise.setValue(TaskSubmission{std::move(status), 0});
           return;
@@ -92,7 +92,7 @@ folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
           return;
         }
         CHECK_EQ(completed_.pop(), program_.get());
-        auto tokens = program_->consume();
+        auto tokens = program_->consume(/*slot_id=*/0);
         active_task_id_ = 0;
         promise.setValue(TaskResult{Status(), std::move(tokens)});
       });
@@ -101,7 +101,7 @@ folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
 
 void TaskExecutionPipeline::launch_loop() {
   while (LlmTaskProgram* program = execution_.pop()) {
-    program->launch();
+    program->launch(/*slot_id=*/0);
     // At most one accepted Task: publishing never depends on GetLast.
     completed_.push(program);
   }
@@ -119,7 +119,7 @@ TaskExecutionPipeline::~TaskExecutionPipeline() {
   launch_thread_.join();
   if (active_task_id_ != 0) {
     CHECK_EQ(completed_.pop(), program_.get());
-    program_->discard();
+    program_->discard(/*slot_id=*/0);
     active_task_id_ = 0;
   }
   CHECK(completed_.empty());
