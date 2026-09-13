@@ -14,6 +14,20 @@ cc_library(
     proto::xllm_proto
 )
 
+if(USE_NPU)
+  cc_library(
+    NAME
+      task_pipeline_model_input_storage
+    HDRS
+      task_pipeline/model_input_storage.h
+    SRCS
+      task_pipeline/model_input_storage.cpp
+    DEPS
+      :task_pipeline_model_input_layout
+      torch
+  )
+endif()
+
 cc_library(
   NAME
     runtime
@@ -98,6 +112,7 @@ cc_library(
     forward_shared_memory_manager.cpp
   DEPS
     :task_pipeline_model_input_layout
+    $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_storage>
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common

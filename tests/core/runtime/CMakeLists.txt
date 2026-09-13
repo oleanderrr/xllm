@@ -22,6 +22,16 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      model_input_storage_test
+    SRCS
+      model_input_storage_test.cpp
+    DEPS
+      :task_pipeline_model_input_storage
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
       dspark_confidence_head_test
     SRCS
       dspark_confidence_head_test.cpp
