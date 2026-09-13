@@ -17,6 +17,17 @@ cc_library(
 if(USE_NPU)
   cc_library(
     NAME
+      task_pipeline_sampling_input_binding
+    HDRS
+      task_pipeline/sampling_input_binding.h
+    SRCS
+      task_pipeline/sampling_input_binding.cpp
+    DEPS
+      :platform
+  )
+
+  cc_library(
+    NAME
       task_pipeline_model_input_binding
     HDRS
       task_pipeline/model_input_binding.h
@@ -136,6 +147,7 @@ cc_library(
     forward_shared_memory_manager.cpp
   DEPS
     :task_pipeline_model_input_layout
+    $<$<BOOL:${USE_NPU}>:task_pipeline_sampling_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_storage>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_preparer>

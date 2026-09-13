@@ -22,6 +22,22 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      sampling_input_binding_test
+    SRCS
+      sampling_input_binding_test.cpp
+    DEPS
+      :task_pipeline_sampling_input_binding
+      :sampler
+      GTest::gtest_main
+  )
+  target_link_libraries(sampling_input_binding_test PRIVATE nnopbase)
+  target_link_options(sampling_input_binding_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
+    NAME
       qwen3_slot_forward_test
     SRCS
       qwen3_slot_forward_test.cpp
