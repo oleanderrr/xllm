@@ -48,3 +48,18 @@ cc_library(
     :kernels
     $<$<BOOL:${USE_NPU}>:xllm_ops>
 )
+
+if(USE_NPU)
+  cc_library(
+    NAME
+      prepared_sampler
+    HDRS
+      prepared_sampler.h
+    SRCS
+      prepared_sampler.cpp
+    DEPS
+      :sampler
+      :xllm_ops
+      :platform
+  )
+endif()

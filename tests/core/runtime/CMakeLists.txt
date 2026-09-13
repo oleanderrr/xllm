@@ -22,6 +22,24 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      prepared_sampler_test
+    SRCS
+      prepared_sampler_test.cpp
+    DEPS
+      :prepared_sampler
+      :task_pipeline_sampling_input_binding
+      :task_pipeline_token_result_storage
+      :sampler
+      GTest::gtest_main
+  )
+  target_link_libraries(prepared_sampler_test PRIVATE nnopbase)
+  target_link_options(prepared_sampler_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
+    NAME
       top_k_top_p_plan_test
     SRCS
       top_k_top_p_plan_test.cpp
