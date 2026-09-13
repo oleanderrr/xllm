@@ -50,6 +50,8 @@ limitations under the License.
 
 namespace xllm {
 
+class SequenceStateRetirementQueue;
+
 enum class SequenceOutputType : int8_t {
   TOKENS = 0,
   EMBEDDINGS = 1,
@@ -141,7 +143,7 @@ class Sequence {
 
   Sequence(const Sequence& other);
   Sequence(const Sequence& other, size_t index);
-  virtual ~Sequence() = default;
+  virtual ~Sequence();
 
   // Polymorphic copy for beam / best_of expansion: same request, new index.
   // Derived types return their own type so no state is sliced away.
@@ -149,6 +151,11 @@ class Sequence {
 
   size_t index() const { return index_; }
   SequenceStateKey sequence_state_key() const { return state_key_; }
+  // Called after all workers accept the current epoch. Repeated dispatch to
+  // the same owner is idempotent; reset ends the epoch before changing owner.
+  // As with reset(), the caller serializes mutations of this Sequence.
+  void track_sequence_state(
+      std::shared_ptr<SequenceStateRetirementQueue> retirements);
 
   // get mm data
   const MMData& mm_data() const { return mm_data_; }
@@ -531,6 +538,7 @@ class Sequence {
 
  private:
   static uint64_t next_state_id();
+  void retire_sequence_state();
   void init_request_state();
   void init_logprob_state(bool force_token_logprobs);
 
@@ -682,6 +690,9 @@ class Sequence {
   // Every constructor, including copy/fork, starts a new Sequence identity.
   // Reset keeps that identity and advances the recomputation epoch.
   SequenceStateKey state_key_{next_state_id(), 0};
+  // Shared only to allow response-side destruction after the Engine is gone.
+  // Copy/fork start unregistered and retain their independently created key.
+  std::shared_ptr<SequenceStateRetirementQueue> state_retirements_;
 
   // for enable_schedule_overlap case
   uint32_t cur_generated_token_idx_;

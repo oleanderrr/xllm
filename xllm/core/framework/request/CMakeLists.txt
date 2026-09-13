@@ -7,6 +7,15 @@ cc_library(
 )
 
 cc_library(
+  NAME sequence_state_retirement_queue
+  HDRS sequence_state_retirement_queue.h
+  SRCS sequence_state_retirement_queue.cpp
+  DEPS
+    :sequence_state_key
+    glog::glog
+)
+
+cc_library(
   NAME 
     request
   HDRS
@@ -64,6 +73,7 @@ cc_library(
     priority_comparator.cpp
   DEPS
     :sequence_state_key
+    :sequence_state_retirement_queue
     :config
     :kv_cache
     :prefix_cache

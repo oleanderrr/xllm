@@ -44,6 +44,8 @@ limitations under the License.
 #include "util/threadpool.h"
 namespace xllm {
 
+class SequenceStateRetirementQueue;
+
 class ModelLoader;
 
 class LLMEngine : public Engine {
@@ -196,6 +198,8 @@ class LLMEngine : public Engine {
   std::vector<std::vector<int32_t>> dp_batch_embedding_ids_;
   std::vector<std::vector<std::string>> dp_batch_request_ids_;
   std::vector<uint64_t> dp_batch_generations_;
+  std::vector<std::shared_ptr<SequenceStateRetirementQueue>>
+      dp_state_retirements_;
 
   // For multi-node serving
   // engine brpc server, all workers connect to engine_server_,

@@ -44,6 +44,7 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/request/sequence_state_retirement_queue.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/hierarchy_block_manager_pool.h"
@@ -124,6 +125,13 @@ LLMEngine::LLMEngine(const runtime::Options& options,
   dp_batch_embedding_ids_.resize(dp_size_);
   dp_batch_request_ids_.resize(dp_size_);
   dp_batch_generations_.resize(dp_size_, 0);
+  if (options_.task_pipeline_slots() > 0) {
+    dp_state_retirements_.reserve(dp_size_);
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      dp_state_retirements_.emplace_back(
+          std::make_shared<SequenceStateRetirementQueue>());
+    }
+  }
   worker_clients_num_ = worker_clients_.size();
   dp_local_size_ = worker_clients_num_ / dp_size_;
   // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
@@ -1162,6 +1170,17 @@ ForwardOutput LLMEngine::step(std::vector<Batch>& batch) {
     }
   }
 
+  // Register only after every worker accepted the input, and before sampled
+  // output can finish a Sequence. A missing row in a later batch stays live.
+  if (options_.task_pipeline_slots() > 0) {
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      for (uint64_t row = 0; row < batch[dp_rank].size(); ++row) {
+        batch[dp_rank][row]->track_sequence_state(
+            dp_state_retirements_[dp_rank]);
+      }
+    }
+  }
+
   if (::xllm::EPLBConfig::get_instance().enable_eplb() &&
       !options_.enable_schedule_overlap() && !is_graph_warmup) {
     process_eplb_data(results, dispatched_activation_token);
@@ -1347,6 +1366,10 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         threadpool_.get(),
         cp_size_,
         options_.task_pipeline_slots() != 0)));
+    if (options_.task_pipeline_slots() > 0) {
+      batched_inputs.back().retired_sequence_state_keys =
+          dp_state_retirements_[dp_rank]->drain();
+    }
     const BatchForwardType& current_batch_forward_type =
         batched_inputs[dp_rank].input_params.meta.batch_forward_type;
     dp_global_token_nums[dp_rank] =

@@ -16,6 +16,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/request/sequence.h"
+#include "core/framework/request/sequence_state_retirement_queue.h"
 #include "core/runtime/params_utils.h"
 
 namespace xllm {
@@ -371,6 +374,201 @@ TEST_F(SequenceStateInputTest, RejectsTruncatedAndUnknownSuffixBeforeKeyRead) {
               &huge,
               sizeof(huge));
   EXPECT_DEATH(unpack(count_overflow), "truncated sequence-state keys");
+}
+
+TEST_F(SequenceStateInputTest, RetiresOnlyDispatchedEpochExactlyOnce) {
+  auto queue = std::make_shared<SequenceStateRetirementQueue>();
+  auto sequence = make_sequence(/*index=*/0);
+  sequence->reset();
+  EXPECT_TRUE(queue->drain().empty());
+  const auto first = sequence->sequence_state_key();
+  sequence->track_sequence_state(queue);
+  sequence->track_sequence_state(queue);
+  // Omitting the Sequence from any number of subsequent batches is not end.
+  EXPECT_TRUE(queue->drain().empty());
+  {
+    Sequence copied(*sequence);
+    auto forked = sequence->fork(/*index=*/1);
+    copied.reset();
+    forked->reset();
+  }
+  EXPECT_TRUE(queue->drain().empty());
+  sequence->reset();
+  expect_keys(queue->drain(), std::array{first});
+  sequence->reset();
+  EXPECT_TRUE(queue->drain().empty());
+  const auto next = sequence->sequence_state_key();
+  sequence->track_sequence_state(queue);
+  sequence.reset();
+  expect_keys(queue->drain(), std::array{next});
+  EXPECT_TRUE(queue->drain().empty());
+  auto never_dispatched = make_sequence(/*index=*/0);
+  never_dispatched.reset();
+  EXPECT_TRUE(queue->drain().empty());
+}
+
+TEST_F(SequenceStateInputTest, OwnerChangesRequireResetAndQueueOutlivesEngine) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  auto first_owner = std::make_shared<SequenceStateRetirementQueue>();
+  auto second_owner = std::make_shared<SequenceStateRetirementQueue>();
+  auto sequence = make_sequence(/*index=*/0);
+  auto unrelated = make_sequence(/*index=*/0);
+  const auto first_key = sequence->sequence_state_key();
+  const auto unrelated_key = unrelated->sequence_state_key();
+  sequence->track_sequence_state(first_owner);
+  unrelated->track_sequence_state(second_owner);
+  EXPECT_DEATH(sequence->track_sequence_state(second_owner),
+               "reset Sequence before changing state owner");
+  sequence->reset();
+  expect_keys(first_owner->drain(), std::array{first_key});
+  EXPECT_TRUE(second_owner->drain().empty());
+  const auto next_key = sequence->sequence_state_key();
+  sequence->track_sequence_state(second_owner);
+  unrelated.reset();
+  sequence.reset();
+  expect_keys(second_owner->drain(), std::array{unrelated_key, next_key});
+  EXPECT_TRUE(first_owner->drain().empty());
+  // A response retains its Sequence after Engine's owning reference is gone.
+  auto late = make_sequence(/*index=*/1);
+  auto engine_queue = std::make_shared<SequenceStateRetirementQueue>();
+  std::weak_ptr<SequenceStateRetirementQueue> observer = engine_queue;
+  late->track_sequence_state(engine_queue);
+  engine_queue.reset();
+  EXPECT_FALSE(observer.expired());
+  late.reset();
+  EXPECT_TRUE(observer.expired());
+}
+
+TEST_F(SequenceStateInputTest, ConcurrentDestructionAndDrainLoseNoIdentities) {
+  constexpr uint32_t kThreads = 4;
+  constexpr uint32_t kPerThread = 128;
+  auto queue = std::make_shared<SequenceStateRetirementQueue>();
+  std::barrier start(kThreads + 1);
+  std::atomic<uint32_t> finished{0};
+  std::vector<std::thread> producers;
+  producers.reserve(kThreads);
+  std::unordered_set<uint64_t> expected;
+  expected.reserve(kThreads * kPerThread);
+  for (uint32_t thread = 0; thread < kThreads; ++thread) {
+    std::vector<std::unique_ptr<Sequence>> owned;
+    owned.reserve(kPerThread);
+    for (uint32_t row = 0; row < kPerThread; ++row) {
+      auto sequence = make_sequence(row,
+                                    /*prompt_size=*/4,
+                                    /*allocate_blocks=*/false);
+      sequence->track_sequence_state(queue);
+      expected.emplace(sequence->sequence_state_key().sequence_id);
+      owned.emplace_back(std::move(sequence));
+    }
+    producers.emplace_back([&, owned = std::move(owned)]() mutable {
+      start.arrive_and_wait();
+      owned.clear();
+      finished.fetch_add(/*arg=*/1, std::memory_order_release);
+    });
+  }
+  std::vector<SequenceStateKey> actual;
+  actual.reserve(kThreads * kPerThread);
+  start.arrive_and_wait();
+  while (finished.load(std::memory_order_acquire) < kThreads) {
+    const auto drained = queue->drain();
+    actual.insert(actual.end(), drained.begin(), drained.end());
+    std::this_thread::yield();
+  }
+  for (std::thread& producer : producers) {
+    producer.join();
+  }
+  const auto remaining = queue->drain();
+  actual.insert(actual.end(), remaining.begin(), remaining.end());
+  ASSERT_EQ(actual.size(), expected.size());
+  for (const SequenceStateKey& key : actual) {
+    EXPECT_EQ(key.epoch, 0U);
+    EXPECT_EQ(expected.erase(key.sequence_id), 1U);
+  }
+  EXPECT_TRUE(expected.empty());
+  EXPECT_TRUE(queue->drain().empty());
+}
+
+TEST_F(SequenceStateInputTest, PackedInputSeparatesRetiredAndRecomputedEpochs) {
+  auto queue = std::make_shared<SequenceStateRetirementQueue>();
+  auto first = make_sequence(/*index=*/0);
+  auto second = make_sequence(/*index=*/1);
+  ForwardInput previous = build({first.get(), second.get()});
+  first->track_sequence_state(queue);
+  second->track_sequence_state(queue);
+  const auto old_key = first->sequence_state_key();
+  first->reset();
+  first->add_blocks(BlockType::KV, manager_->allocate(/*num_blocks=*/1));
+  ForwardInput next = build({second.get(), first.get()});
+  next.retired_sequence_state_keys = queue->drain();
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(next, &packed));
+  const ForwardInput received = unpack(packed);
+  expect_keys(
+      received.sequence_state_keys,
+      std::array{second->sequence_state_key(), first->sequence_state_key()});
+  expect_keys(received.retired_sequence_state_keys, std::array{old_key});
+  expect_keys(previous.sequence_state_keys,
+              std::array{old_key, second->sequence_state_key()});
+  first->track_sequence_state(queue);
+  const auto next_key = first->sequence_state_key();
+  const auto second_key = second->sequence_state_key();
+  first.reset();
+  second.reset();
+  ForwardInput idle;
+  idle.retired_sequence_state_keys = queue->drain();
+  ASSERT_TRUE(forward_input_to_packed_proto(idle, &packed));
+  const ForwardInput control = unpack(packed);
+  EXPECT_TRUE(control.sequence_state_keys.empty());
+  expect_keys(control.retired_sequence_state_keys,
+              std::array{next_key, second_key});
+  EXPECT_TRUE(queue->drain().empty());
+}
+
+TEST_F(SequenceStateInputTest, SequenceRetirementPerformance) {
+  if (std::getenv(/*name=*/"XLLM_PIPELINE_PERF") == nullptr) {
+    GTEST_SKIP() << "Run separately with XLLM_PIPELINE_PERF=1.";
+  }
+  constexpr int32_t kIterations = 256;
+  for (uint32_t rows : std::array<uint32_t, 4>{1, 4, 32, 128}) {
+    auto queue = std::make_shared<SequenceStateRetirementQueue>();
+    std::vector<std::unique_ptr<Sequence>> sequences;
+    sequences.reserve(rows);
+    for (uint32_t row = 0; row < rows; ++row) {
+      sequences.emplace_back(make_sequence(row,
+                                           /*prompt_size=*/4,
+                                           /*allocate_blocks=*/false));
+    }
+    std::vector<SequenceStateKey> retired;
+    const auto cycle = [&]() {
+      for (const auto& sequence : sequences) {
+        sequence->track_sequence_state(queue);
+        sequence->reset();
+      }
+      retired = queue->drain();
+    };
+    for (int32_t round = 0; round < 3; ++round) {
+      for (int32_t warmup = 0; warmup < 8; ++warmup) {
+        cycle();
+      }
+      const auto begin = std::chrono::steady_clock::now();
+      for (int32_t step = 0; step < kIterations; ++step) {
+        cycle();
+      }
+      const double us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count() /
+                        kIterations;
+      ASSERT_EQ(retired.size(), rows);
+      for (uint32_t row = 0; row < rows; ++row) {
+        const auto key = sequences[row]->sequence_state_key();
+        EXPECT_EQ(retired[row].sequence_id, key.sequence_id);
+        EXPECT_EQ(retired[row].epoch + 1, key.epoch);
+      }
+      EXPECT_TRUE(queue->drain().empty());
+      LOG(INFO) << "STATE_RETIREMENT_PERF rows=" << rows << " round=" << round
+                << " us=" << us << " iterations=" << kIterations;
+    }
+  }
 }
 
 TEST_F(SequenceStateInputTest, PackedIdentityPerformance) {

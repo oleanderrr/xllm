@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/prefix_cache/block_hasher.h"
+#include "core/framework/request/sequence_state_retirement_queue.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/util/slice.h"
 #include "core/util/tensor_helper.h"
@@ -169,6 +170,25 @@ Sequence::Sequence(size_t index,
 
 std::unique_ptr<Sequence> Sequence::fork(size_t index) const {
   return std::make_unique<Sequence>(*this, index);
+}
+
+Sequence::~Sequence() { retire_sequence_state(); }
+
+void Sequence::track_sequence_state(
+    std::shared_ptr<SequenceStateRetirementQueue> retirements) {
+  CHECK(retirements != nullptr);
+  CHECK(state_retirements_ == nullptr || state_retirements_ == retirements)
+      << "reset Sequence before changing state owner";
+  if (state_retirements_ == nullptr) {
+    state_retirements_ = std::move(retirements);
+  }
+}
+
+void Sequence::retire_sequence_state() {
+  if (state_retirements_ != nullptr) {
+    state_retirements_->retire(state_key_);
+    state_retirements_.reset();
+  }
 }
 
 Sequence::Sequence(const Sequence& other) : Sequence(other, other.index_) {}
@@ -756,6 +776,7 @@ void Sequence::clear_host_cache_match() {
 // release all cache blocks
 void Sequence::reset() {
   CHECK_LT(state_key_.epoch, std::numeric_limits<uint64_t>::max());
+  retire_sequence_state();
   ++state_key_.epoch;
   kv_state_.reset();
   host_kv_state_.reset();
