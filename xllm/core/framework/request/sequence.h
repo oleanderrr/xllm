@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/common/types.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/prefix_cache/block_hasher.h"
+#include "core/framework/request/sequence_state_key.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/tokenizer/tokenizer.h"
@@ -147,6 +148,7 @@ class Sequence {
   virtual std::unique_ptr<Sequence> fork(size_t index) const;
 
   size_t index() const { return index_; }
+  SequenceStateKey sequence_state_key() const { return state_key_; }
 
   // get mm data
   const MMData& mm_data() const { return mm_data_; }
@@ -528,6 +530,7 @@ class Sequence {
   size_t num_valid_tokens() const;
 
  private:
+  static uint64_t next_state_id();
   void init_request_state();
   void init_logprob_state(bool force_token_logprobs);
 
@@ -675,6 +678,10 @@ class Sequence {
 
   // seq id in the batch
   int32_t seq_id_ = -1;
+
+  // Every constructor, including copy/fork, starts a new Sequence identity.
+  // Reset keeps that identity and advances the recomputation epoch.
+  SequenceStateKey state_key_{next_state_id(), 0};
 
   // for enable_schedule_overlap case
   uint32_t cur_generated_token_idx_;

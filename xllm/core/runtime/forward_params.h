@@ -31,6 +31,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/request/sequence_state_key.h"
 #include "framework/config/execution_config.h"
 #include "framework/model/model_input_params.h"
 #include "framework/sampling/beam_searcher.h"
@@ -539,6 +540,8 @@ struct ForwardInput {
     inputs.kv_slot_layout = kv_slot_layout;
     inputs.metadata_ready_event = metadata_ready_event;
     inputs.retained_device_tensors = retained_device_tensors;
+    inputs.sequence_state_keys = sequence_state_keys;
+    inputs.retired_sequence_state_keys = retired_sequence_state_keys;
     inputs.sample_sequence_ids = sample_sequence_ids;
     inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
@@ -597,6 +600,10 @@ struct ForwardInput {
   ModelInputParams input_params;
   SamplingParameters sampling_params;
   SamplingParameters decoder_sampling_params;
+  // Task pipeline: current actual model rows and explicit lifecycle ends.
+  // Padding rows have no key. Sample rows use selected/sample index mappings.
+  std::vector<SequenceStateKey> sequence_state_keys;
+  std::vector<SequenceStateKey> retired_sequence_state_keys;
   std::vector<std::string> sample_sequence_ids;
   std::vector<int32_t> sample_prior_output_rows;
   std::vector<JsonObjectGrammarState> json_object_states;

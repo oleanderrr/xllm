@@ -63,6 +63,7 @@ cc_library(
     stopping_checker.cpp
     priority_comparator.cpp
   DEPS
+    :sequence_state_key
     :config
     :kv_cache
     :prefix_cache

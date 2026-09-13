@@ -92,6 +92,10 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
   return reinterpret_cast<std::uintptr_t>(ptr) % kCudaZeroCopyAlignment == 0;
 }
 
+// Optional descriptor suffix. The low byte is its schema version.
+constexpr uint64_t kSequenceStateExtension = 0x584c4c4d53535101ULL;
+static_assert(sizeof(SequenceStateKey) == 2 * sizeof(uint64_t));
+
 struct RawInputLayoutHeader final {
   uint64_t descriptor_bytes = 0;
   uint64_t tensor_arena_offset = 0;
@@ -1579,6 +1583,28 @@ inline void read_vector(ReadContext& context, std::vector<T>& vec) {
   }
 }
 
+void read_sequence_state_keys(ReadContext& context,
+                              const char* descriptor_end,
+                              std::vector<SequenceStateKey>& keys) {
+  CHECK_LE(context.descriptor_cursor, descriptor_end);
+  CHECK_GE(descriptor_end - context.descriptor_cursor,
+           static_cast<int64_t>(sizeof(uint64_t)))
+      << "truncated sequence-state count";
+  uint64_t count = 0;
+  std::memcpy(&count, context.descriptor_cursor, sizeof(count));
+  advance_descriptor_cursor(context, sizeof(count));
+  const uint64_t remaining =
+      static_cast<uint64_t>(descriptor_end - context.descriptor_cursor);
+  CHECK_LE(count, remaining / sizeof(SequenceStateKey))
+      << "truncated sequence-state keys";
+  keys.resize(count);
+  const uint64_t bytes = count * sizeof(SequenceStateKey);
+  if (bytes != 0) {
+    std::memcpy(keys.data(), context.descriptor_cursor, bytes);
+    advance_descriptor_cursor(context, bytes);
+  }
+}
+
 void read_json_object_state_snapshots(
     ReadContext& context,
     std::vector<JsonObjectGrammarSnapshot>& snapshots) {
@@ -2568,6 +2594,27 @@ inline void deserialize_forward_input_payload(
         context, input_params.dit_forward_input, stabilize_dit_host_tensors);
   }
 
+  const char* descriptor_end = descriptor_base + layout.descriptor_bytes;
+  CHECK_LE(context.descriptor_cursor, descriptor_end);
+  forward_input.sequence_state_keys.clear();
+  forward_input.retired_sequence_state_keys.clear();
+  if (context.descriptor_cursor != descriptor_end) {
+    CHECK_GE(descriptor_end - context.descriptor_cursor,
+             static_cast<int64_t>(sizeof(uint64_t)))
+        << "truncated sequence-state extension";
+    uint64_t extension = 0;
+    std::memcpy(&extension, context.descriptor_cursor, sizeof(extension));
+    advance_descriptor_cursor(context, sizeof(extension));
+    CHECK_EQ(extension, kSequenceStateExtension)
+        << "unknown forward-input descriptor extension";
+    read_sequence_state_keys(
+        context, descriptor_end, forward_input.sequence_state_keys);
+    read_sequence_state_keys(
+        context, descriptor_end, forward_input.retired_sequence_state_keys);
+    CHECK_EQ(context.descriptor_cursor, descriptor_end)
+        << "unexpected sequence-state extension tail";
+  }
+
   finalize_device_buffer_session(device_session, stream);
   forward_input.input_host_buffer_has_layout = true;
   if (materialize_device_buffer &&
@@ -3007,6 +3054,14 @@ inline void serialize_forward_input_sections(
   write_data(context.descriptor, has_dit_forward_input);
   if (has_dit_forward_input) {
     write_dit_forward_input(context, input_params.dit_forward_input);
+  }
+  if (!input.sequence_state_keys.empty() ||
+      !input.retired_sequence_state_keys.empty()) {
+    write_bytes(context.descriptor,
+                &kSequenceStateExtension,
+                sizeof(kSequenceStateExtension));
+    write_vector(context.descriptor, input.sequence_state_keys);
+    write_vector(context.descriptor, input.retired_sequence_state_keys);
   }
 }
 

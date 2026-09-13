@@ -85,7 +85,8 @@ class Batch {
   ForwardInput prepare_forward_input(uint32_t num_decoding_tokens,
                                      uint32_t min_decoding_bach_size,
                                      const ModelArgs& args,
-                                     int32_t cp_size = 1);
+                                     int32_t cp_size = 1,
+                                     bool include_sequence_state_keys = false);
 
   ForwardInput prepare_rec_forward_input(uint32_t num_decoding_tokens,
                                          uint32_t min_decoding_batch_size,
@@ -95,7 +96,8 @@ class Batch {
   // Prepare ForwardInput for distributed transport.
   ForwardInput prepare_forward_input(const ModelArgs& args,
                                      ThreadPool* thread_pool,
-                                     int32_t cp_size = 1);
+                                     int32_t cp_size = 1,
+                                     bool include_sequence_state_keys = false);
 
   // process output
   //

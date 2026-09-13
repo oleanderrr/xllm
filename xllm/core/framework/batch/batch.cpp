@@ -195,7 +195,8 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
                                           const ModelArgs& args,
-                                          int32_t cp_size) {
+                                          int32_t cp_size,
+                                          bool include_sequence_state_keys) {
   if (sequences_.empty() && !sequence_groups_.empty()) {
     output_targets_.clear();
     return prepare_rec_forward_input(
@@ -210,7 +211,9 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             batch_id_,
                             &args,
                             batch_forward_type_,
-                            cp_size);
+                            cp_size,
+                            /*thread_pool=*/nullptr,
+                            include_sequence_state_keys);
   ForwardInput forward_input =
       builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
   linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();
@@ -418,7 +421,8 @@ std::unordered_map<uint32_t, uint32_t> Batch::cal_seq_exchange_index(
 
 ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
                                           ThreadPool* thread_pool,
-                                          int32_t cp_size) {
+                                          int32_t cp_size,
+                                          bool include_sequence_state_keys) {
   dp_balance_shuffle_seqs();
   refresh_output_targets();
   BatchInputBuilder builder(sequences_,
@@ -430,7 +434,8 @@ ForwardInput Batch::prepare_forward_input(const ModelArgs& args,
                             &args,
                             batch_forward_type_,
                             cp_size,
-                            thread_pool);
+                            thread_pool,
+                            include_sequence_state_keys);
   ForwardInput forward_input =
       builder.build_forward_input(/*num_decoding_tokens=*/0,
                                   /*min_decoding_batch_size=*/0);

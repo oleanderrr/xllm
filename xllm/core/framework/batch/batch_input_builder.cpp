@@ -215,7 +215,8 @@ BatchInputBuilder::BatchInputBuilder(
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
     int32_t cp_size,
-    ThreadPool* thread_pool)
+    ThreadPool* thread_pool,
+    bool include_sequence_state_keys)
     : sequences_(sequences),
       allowed_max_tokens_(allowed_max_tokens),
       input_embeddings_vec_(input_embeddings_vec),
@@ -223,6 +224,7 @@ BatchInputBuilder::BatchInputBuilder(
       args_(args),
       enable_json_object_output_(
           ServiceConfig::get_instance().enable_json_object_output()),
+      include_sequence_state_keys_(include_sequence_state_keys),
       thread_pool_(thread_pool),
       num_sequences_(sequences.size()),
       swap_block_transfer_infos_(swap_block_transfer_infos),
@@ -1197,6 +1199,15 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   }
 
   ForwardInput forward_input;
+  if (include_sequence_state_keys_) {
+    // Both build paths preserve the original Sequence order. Padding has no
+    // Sequence identity; these keys describe actual rows only.
+    forward_input.sequence_state_keys.reserve(sequences_.size());
+    for (const Sequence* sequence : sequences_) {
+      forward_input.sequence_state_keys.emplace_back(
+          sequence->sequence_state_key());
+    }
+  }
 
   // Create tensors
   forward_input.token_ids =

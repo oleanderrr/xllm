@@ -137,8 +137,11 @@ PyExecutorImpl::~PyExecutorImpl() {
 }
 
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
-  return batch.prepare_forward_input(
-      options_.num_decoding_tokens(), 0, args_, options_.cp_size());
+  return batch.prepare_forward_input(options_.num_decoding_tokens(),
+                                     /*min_decoding_batch_size=*/0,
+                                     args_,
+                                     options_.cp_size(),
+                                     options_.task_pipeline_slots() != 0);
 }
 
 void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {

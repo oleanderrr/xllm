@@ -1343,7 +1343,10 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     // LINEAR leaf inside allocate_for_sequence (scheduler-side), so the builder
     // below already sees the rotated live slot -- no apply step is needed here.
     batched_inputs.emplace_back(std::move(batch[dp_rank].prepare_forward_input(
-        args_, threadpool_.get(), cp_size_)));
+        args_,
+        threadpool_.get(),
+        cp_size_,
+        options_.task_pipeline_slots() != 0)));
     const BatchForwardType& current_batch_forward_type =
         batched_inputs[dp_rank].input_params.meta.batch_forward_type;
     dp_global_token_nums[dp_rank] =

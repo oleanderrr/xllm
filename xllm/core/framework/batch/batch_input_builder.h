@@ -49,7 +49,8 @@ class BatchInputBuilder {
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
       int32_t cp_size = 1,
-      ThreadPool* thread_pool = nullptr);
+      ThreadPool* thread_pool = nullptr,
+      bool include_sequence_state_keys = false);
 
   ForwardInput build_forward_input(uint32_t num_decoding_tokens,
                                    uint32_t min_decoding_batch_size);
@@ -192,6 +193,7 @@ class BatchInputBuilder {
 
   // Configuration
   bool enable_json_object_output_ = true;
+  bool include_sequence_state_keys_ = false;
   bool use_mrope_ = false;
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;

@@ -22,6 +22,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -45,6 +46,14 @@ namespace xllm {
 namespace {
 constexpr char kEmptyLogprobsFinishReason[] = "empty_logprobs";
 }  // namespace
+
+uint64_t Sequence::next_state_id() {
+  static std::atomic<uint64_t> next_id{1};
+  const uint64_t id = next_id.fetch_add(/*arg=*/1, std::memory_order_relaxed);
+  CHECK_NE(id, 0U);
+  CHECK_NE(id, std::numeric_limits<uint64_t>::max());
+  return id;
+}
 
 void Sequence::init_request_state() {
   if (sequence_params_.request_failure_state == nullptr) {
@@ -746,6 +755,8 @@ void Sequence::clear_host_cache_match() {
 
 // release all cache blocks
 void Sequence::reset() {
+  CHECK_LT(state_key_.epoch, std::numeric_limits<uint64_t>::max());
+  ++state_key_.epoch;
   kv_state_.reset();
   host_kv_state_.reset();
   clear_host_cache_match();
