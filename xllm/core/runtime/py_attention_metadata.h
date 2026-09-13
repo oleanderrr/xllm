@@ -71,6 +71,7 @@ class PyAttentionMetadataView final {
   const torch::Tensor& paged_kv_last_page_len() const;
   pybind11::object qo_indptr() const;
   pybind11::object q_cu_seq_lens() const;
+  const std::vector<int64_t>& q_cu_seq_lens_host_values() const;
   pybind11::object kv_cu_seq_lens() const;
   pybind11::object kv_seq_lens_host() const;
   const std::vector<int32_t>& kv_seq_lens_host_values() const;

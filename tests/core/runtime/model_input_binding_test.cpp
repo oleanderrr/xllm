@@ -22,6 +22,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/layers/common/attention_metadata.h"
+
 namespace xllm {
 namespace {
 
@@ -325,6 +327,42 @@ TEST_F(ModelInputBindingTest, CallerSuppliedDummyRowHasNoActualSequence) {
   EXPECT_EQ(binding_->params().meta.num_sequences, 1);
   EXPECT_EQ(binding_->params().meta.actual_num_sequences, 0);
   EXPECT_EQ(binding_->tokens().numel(), 1);
+}
+
+TEST_F(ModelInputBindingTest, PythonMetadataIsPrivateAndUsesFixedViews) {
+  InputData first = make_input({3, 2}, {3, 2});
+  ASSERT_TRUE(binding_
+                  ->prepare(view(first),
+                            {BatchForwardType::PREFILL, 2, 1, false},
+                            *transfer_)
+                  .ok());
+  const auto metadata = binding_->params().attn_metadata;
+  const void* token_address = binding_->tokens().data_ptr();
+  const void* length_address = metadata->q_seq_lens.data_ptr();
+  std::unique_ptr<ModelInputStorage> other_storage;
+  ASSERT_TRUE(ModelInputStorage::create(
+                  {16, 4, 5}, storage_->device_buffer().device(), other_storage)
+                  .ok());
+  ModelInputBinding other(*other_storage);
+  const InputData second = make_input({1}, {4});
+  ASSERT_TRUE(other
+                  .prepare(view(second),
+                           {BatchForwardType::DECODE, 1, 2, false},
+                           *transfer_)
+                  .ok());
+  first.query.assign(first.query.size(), /*value=*/-99);
+  EXPECT_EQ(metadata->q_seq_lens_vec, (std::vector<int32_t>{3, 2}));
+  EXPECT_EQ(metadata->q_cu_seq_lens_host_vec, (std::vector<int64_t>{3, 5}));
+  EXPECT_EQ(metadata->max_query_len, 3);
+  EXPECT_TRUE(metadata->is_prefill);
+  EXPECT_FALSE(metadata->block_table.defined());
+  EXPECT_EQ(metadata->q_seq_lens.data_ptr(), length_address);
+  EXPECT_EQ(binding_->tokens().data_ptr(), token_address);
+  EXPECT_EQ(metadata->q_cu_seq_lens.data_ptr(),
+            storage_->device().q_cu_seq_lens.data_ptr());
+  EXPECT_NE(metadata, other.params().attn_metadata);
+  EXPECT_TRUE(other.params().attn_metadata->block_table.defined());
+  ASSERT_EQ(transfer_->synchronize(), 0);
 }
 
 }  // namespace

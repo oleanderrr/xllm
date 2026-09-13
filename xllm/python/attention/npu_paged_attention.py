@@ -281,11 +281,19 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 batch_size = metadata.block_table.shape[0]
             else:
                 batch_size = max(metadata.q_cu_seq_lens.numel() - 1, 0)
-            q_seq_ends = self._query_sequence_ends(
-                metadata.q_cu_seq_lens,
-                batch_size,
-            )
-            self._actual_seq_lens = q_seq_ends.cpu().tolist()
+            host_query_ends = getattr(metadata, "q_cu_seq_lens_host_values", None)
+            if host_query_ends:
+                if len(host_query_ends) == batch_size + 1 and host_query_ends[0] == 0:
+                    host_query_ends = host_query_ends[1:]
+                if len(host_query_ends) != batch_size:
+                    raise RuntimeError("host query ends must have one entry per sequence")
+                self._actual_seq_lens = host_query_ends
+            else:
+                q_seq_ends = self._query_sequence_ends(
+                    metadata.q_cu_seq_lens,
+                    batch_size,
+                )
+                self._actual_seq_lens = q_seq_ends.cpu().tolist()
         else:
             self._actual_seq_lens = None
 

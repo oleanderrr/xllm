@@ -28,8 +28,8 @@ struct ModelInputBatch {
   bool is_graph_warmup = false;
 };
 
-// Binds the ordinary non-MLA model input domain. Model-specific metadata and
-// shared KV/state dependencies must be prepared separately before execution.
+// Binds ordinary Python non-MLA input and paged-attention metadata. Shared
+// KV/state dependencies are established by the caller before execution.
 // Borrows storage until all model readers and event waits have completed.
 class ModelInputBinding final {
  public:

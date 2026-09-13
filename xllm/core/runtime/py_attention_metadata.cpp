@@ -82,6 +82,9 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly("qo_indptr", &PyAttentionMetadataView::qo_indptr)
       .def_property_readonly("q_cu_seq_lens",
                              &PyAttentionMetadataView::q_cu_seq_lens)
+      .def_property_readonly(
+          "q_cu_seq_lens_host_values",
+          &PyAttentionMetadataView::q_cu_seq_lens_host_values)
       .def_property_readonly("kv_cu_seq_lens",
                              &PyAttentionMetadataView::kv_cu_seq_lens)
       .def_property_readonly("kv_seq_lens_host",
@@ -260,6 +263,16 @@ py::object PyAttentionMetadataView::qo_indptr() const {
 
 py::object PyAttentionMetadataView::q_cu_seq_lens() const {
   return optional_tensor(metadata_->q_cu_seq_lens);
+}
+
+const std::vector<int64_t>& PyAttentionMetadataView::q_cu_seq_lens_host_values()
+    const {
+#if defined(USE_NPU)
+  return metadata_->q_cu_seq_lens_host_vec;
+#else
+  static const std::vector<int64_t> kNoHostQueryEnds;
+  return kNoHostQueryEnds;
+#endif
 }
 
 py::object PyAttentionMetadataView::kv_cu_seq_lens() const {

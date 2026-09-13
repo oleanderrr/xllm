@@ -17,6 +17,9 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
+
+#include "core/layers/common/attention_metadata.h"
 
 namespace xllm {
 namespace {
@@ -93,6 +96,11 @@ ModelInputBinding::ModelInputBinding(ModelInputStorage& storage)
     lengths->reserve(capacity.max_sequences);
   }
   host.new_cache_slots.reserve(capacity.max_tokens);
+  params_.attn_metadata = std::make_shared<layer::AttentionMetadata>();
+  auto& metadata = *params_.attn_metadata;
+  metadata.q_seq_lens_vec.reserve(capacity.max_sequences);
+  metadata.kv_seq_lens_vec.reserve(capacity.max_sequences);
+  metadata.q_cu_seq_lens_host_vec.reserve(capacity.max_sequences);
 }
 
 Status ModelInputBinding::prepare(const ModelInputHostView& input,
@@ -149,6 +157,37 @@ Status ModelInputBinding::prepare(const ModelInputHostView& input,
   params_.meta.is_graph_warmup = batch.is_graph_warmup;
   params_.meta.q_max_seq_len = maximum(host.q_seq_lens);
   params_.meta.kv_max_seq_len = maximum(host.kv_seq_lens);
+  // These are the original Python paged-attention inputs. The Slot owns the
+  // tensor views and Host metadata until its last reader retires. No model
+  // invocation, rotary computation or attention kernel is created here.
+  auto& metadata = *params_.attn_metadata;
+  metadata.q_seq_lens = attention.q_seq_lens;
+  metadata.kv_seq_lens = attention.kv_seq_lens;
+  metadata.q_cu_seq_lens = attention.q_cu_seq_lens;
+  metadata.qo_indptr = attention.q_cu_seq_lens;
+  metadata.slot_mapping = attention.new_cache_slots;
+  metadata.block_table = batch.forward_type.is_prefill()
+                             ? torch::Tensor()
+                             : attention.block_tables;
+  metadata.q_seq_lens_vec.assign(host.q_seq_lens.begin(),
+                                 host.q_seq_lens.end());
+  metadata.kv_seq_lens_vec.assign(host.kv_seq_lens.begin(),
+                                  host.kv_seq_lens.end());
+  metadata.q_cu_seq_lens_host_vec.assign(host.q_cu_seq_lens.begin(),
+                                         host.q_cu_seq_lens.end());
+  metadata.q_seq_lens_host =
+      staging.q_seq_lens.narrow(/*dim=*/0, /*start=*/0, rows);
+  metadata.kv_seq_lens_host =
+      staging.kv_seq_lens.narrow(/*dim=*/0, /*start=*/0, rows);
+  metadata.max_query_len = params_.meta.q_max_seq_len;
+  metadata.max_seq_len = params_.meta.kv_max_seq_len;
+  metadata.total_kv_len = std::accumulate(
+      host.kv_seq_lens.begin(), host.kv_seq_lens.end(), int64_t{0});
+  metadata.is_prefill = batch.forward_type.is_prefill();
+  metadata.is_chunked_prefill =
+      batch.forward_type.is_chunked_prefill() || batch.forward_type.is_mixed();
+  metadata.is_mixed = batch.forward_type.is_mixed();
+  metadata.is_dummy = rows == 0;
   transfer_info_ = transferred;
   return Status();
 }
