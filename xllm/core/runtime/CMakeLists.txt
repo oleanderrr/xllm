@@ -17,6 +17,17 @@ cc_library(
 if(USE_NPU)
   cc_library(
     NAME
+      task_pipeline_token_result_storage
+    HDRS
+      task_pipeline/token_result_storage.h
+    SRCS
+      task_pipeline/token_result_storage.cpp
+    DEPS
+      :platform
+  )
+
+  cc_library(
+    NAME
       task_pipeline_sampling_input_binding
     HDRS
       task_pipeline/sampling_input_binding.h
@@ -148,6 +159,7 @@ cc_library(
   DEPS
     :task_pipeline_model_input_layout
     $<$<BOOL:${USE_NPU}>:task_pipeline_sampling_input_binding>
+    $<$<BOOL:${USE_NPU}>:task_pipeline_token_result_storage>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_storage>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_preparer>

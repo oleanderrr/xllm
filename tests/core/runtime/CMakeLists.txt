@@ -22,6 +22,20 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      token_result_storage_test
+    SRCS
+      token_result_storage_test.cpp
+    DEPS
+      :task_pipeline_token_result_storage
+      GTest::gtest_main
+  )
+  target_link_options(token_result_storage_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
+    NAME
       sampling_input_binding_test
     SRCS
       sampling_input_binding_test.cpp
