@@ -36,8 +36,8 @@ bool overlaps_host(std::span<const int32_t> source,
                        : base - start < source.size_bytes();
 }
 
-Status validate(const ModelInputHostView& input,
-                const ModelInputStorage& storage) {
+Status validate_input(const ModelInputHostView& input,
+                      const ModelInputStorage& storage) {
   const ModelInputCapacity& capacity = storage.layout().capacity;
   const uint64_t tokens = input.token_ids.size();
   const uint64_t rows = input.q_seq_lens.size();
@@ -94,10 +94,14 @@ ModelInputPreparer::ModelInputPreparer(ModelInputStorage& storage)
   ready_event_ = std::make_shared<StreamEvent>(event);
 }
 
+Status ModelInputPreparer::validate(const ModelInputHostView& input) const {
+  return validate_input(input, storage_);
+}
+
 Status ModelInputPreparer::prepare(const ModelInputHostView& input,
                                    const Stream& stream,
                                    ModelInputTransferInfo& info) {
-  Status status = validate(input, storage_);
+  Status status = validate(input);
   if (!status.ok()) {
     return status;
   }

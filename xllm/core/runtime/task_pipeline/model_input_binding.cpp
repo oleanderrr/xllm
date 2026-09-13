@@ -103,6 +103,13 @@ ModelInputBinding::ModelInputBinding(ModelInputStorage& storage)
   metadata.q_cu_seq_lens_host_vec.reserve(capacity.max_sequences);
 }
 
+Status ModelInputBinding::validate(const ModelInputHostView& input,
+                                   const ModelInputBatch& batch) const {
+  Status status =
+      validate_batch(input, batch, storage_.layout().capacity.max_sequences);
+  return status.ok() ? preparer_.validate(input) : status;
+}
+
 Status ModelInputBinding::prepare(const ModelInputHostView& input,
                                   const ModelInputBatch& batch,
                                   const Stream& stream) {
@@ -117,6 +124,7 @@ Status ModelInputBinding::prepare(const ModelInputHostView& input,
     return status;
   }
 
+  params_.python_attention_metadata.reset();
   const uint32_t rows = transferred.sequences;
   const uint32_t token_count = transferred.tokens;
   const ModelInputTensors& staging = storage_.host();

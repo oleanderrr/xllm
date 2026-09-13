@@ -84,6 +84,8 @@ cc_library(
     dit_forward_params.h
     params_utils.h
     executor.h
+    $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_program.h>
+    $<$<BOOL:${USE_NPU}>:task_pipeline/task_execution_pipeline.h>
     executor_impl.h
     executor_impl_factory.h
     vlm_executor_impl.h
@@ -122,6 +124,8 @@ cc_library(
   SRCS
     decode_graph_bucket.cpp
     executor.cpp
+    $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_program.cpp>
+    $<$<BOOL:${USE_NPU}>:task_pipeline/task_execution_pipeline.cpp>
     executor_impl_factory.cpp
     base_executor_impl.cpp
     vlm_executor_impl.cpp
@@ -182,6 +186,7 @@ cc_library(
     :kv_transfer_completion
     :models
     :sampler
+    $<$<BOOL:${USE_NPU}>:prepared_sampler>
     :tokenizer
     :model_loader
     :util
@@ -204,4 +209,8 @@ cc_library(
 
 if(USE_XLITE)
   xllm_link_xlite(runtime)
+endif()
+
+if(USE_NPU)
+  target_link_libraries(runtime PUBLIC nnopbase)
 endif()

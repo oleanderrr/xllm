@@ -50,6 +50,8 @@ class SamplingInputBinding final {
   SamplingInputBinding(const SamplingInputBinding&) = delete;
   SamplingInputBinding& operator=(const SamplingInputBinding&) = delete;
 
+  Status validate(const SamplingParameters& input, uint32_t model_tokens) const;
+
   // Reads only contiguous CPU tensors. After success, source storage may be
   // released or overwritten: H2D reads owned pinned staging. Record the Task's
   // final ready event after this and every other preparation, then wait on it
@@ -70,8 +72,6 @@ class SamplingInputBinding final {
                        torch::Device device,
                        torch::ScalarType parameter_dtype,
                        uint64_t bytes);
-
-  Status validate(const SamplingParameters& input, uint32_t model_tokens) const;
 
   SamplingInputCapacity capacity_;
   torch::Device device_;

@@ -37,6 +37,9 @@ class ModelInputBinding final {
   ModelInputBinding(const ModelInputBinding&) = delete;
   ModelInputBinding& operator=(const ModelInputBinding&) = delete;
 
+  Status validate(const ModelInputHostView& input,
+                  const ModelInputBatch& batch) const;
+
   // Validation failures preserve the previous binding, storage and event.
   // Successful return stabilizes source data, but H2D can remain in flight.
   Status prepare(const ModelInputHostView& input,
@@ -47,6 +50,7 @@ class ModelInputBinding final {
   // Views keep the fixed storage alive; reuse still requires reader retirement.
   const torch::Tensor& tokens() const { return tokens_; }
   const torch::Tensor& positions() const { return positions_; }
+  ModelInputParams& params() { return params_; }
   const ModelInputParams& params() const { return params_; }
   const ModelInputTransferInfo& transfer_info() const { return transfer_info_; }
   const StreamEventPtr& ready_event() const { return preparer_.ready_event(); }

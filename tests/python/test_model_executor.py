@@ -1300,3 +1300,43 @@ class TestExecuteRouting:
             None,
         )
         assert torch.equal(result, torch.ones(4))
+
+
+class _PreparedStubAttentionBackend(StubAttentionBackend):
+    @property
+    def supports_prepared_metadata(self) -> bool:
+        return True
+
+    def prepare_metadata(self, metadata: AttentionMetadata) -> object:
+        return SimpleNamespace(source=metadata.q_cu_seq_lens_host_values)
+
+
+def test_executor_prepares_private_metadata_after_cache_binding() -> None:
+    backend = _PreparedStubAttentionBackend()
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(_FakeModel(), {"model_type": "qwen3"}, max_seqs_per_batch=2)
+    assert executor.supports_prepared_metadata
+    metadata = SimpleNamespace(q_cu_seq_lens_host_values=[1, 2])
+    with pytest.raises(RuntimeError, match="initialized"):
+        executor.prepare_metadata(metadata)
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    executor.prepare_metadata(metadata)
+    assert metadata.prepared_attention_state.source == [1, 2]
+    assert not backend._prepared
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [{"tp_size": 2}, {"dp_size": 2}, {"cp_size": 2}, {"ep_size": 2}, {"moe_tp_size": 2}, {"model_type": "llama"}],
+)
+def test_executor_rejects_unsupported_prepared_metadata(unsupported: dict[str, object]) -> None:
+    backend = _PreparedStubAttentionBackend()
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(_FakeModel(), {"model_type": "qwen3", **unsupported}, max_seqs_per_batch=2)
+    assert not executor.supports_prepared_metadata
+    metadata = SimpleNamespace(q_cu_seq_lens_host_values=[1, 2])
+    with pytest.raises(RuntimeError, match="single-rank eager Qwen3"):
+        executor.prepare_metadata(metadata)
+    assert not hasattr(metadata, "prepared_attention_state")
+    assert not backend._prepared

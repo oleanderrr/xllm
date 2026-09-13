@@ -175,6 +175,15 @@ class ModelExecutor:
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
+        self._supports_prepared_metadata = (
+            self.attention_backend.supports_prepared_metadata
+            and config.get("model_type") == "qwen3"
+            and graph_backend in ("", "off", "none", "0")
+            and all(
+                int(config.get(key, 1)) == 1
+                for key in ("tp_size", "dp_size", "cp_size", "ep_size", "moe_tp_size", "layerwise_split_size")
+            )
+        )
         if dp_size > 1 and graph_backend not in (
             "",
             "off",
@@ -263,6 +272,15 @@ class ModelExecutor:
             layer.fia_next_tokens,
             layer.fia_use_attention_mask,
         )
+
+    @property
+    def supports_prepared_metadata(self) -> bool:
+        return self._supports_prepared_metadata
+
+    def prepare_metadata(self, metadata: AttentionMetadata) -> None:
+        if not self._supports_prepared_metadata or not self._kv_bound:
+            raise RuntimeError("prepared metadata requires an initialized single-rank eager Qwen3 executor")
+        metadata.prepared_attention_state = self.attention_backend.prepare_metadata(metadata)
 
     def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
         layer_caches = normalize_layer_caches(kv_caches)

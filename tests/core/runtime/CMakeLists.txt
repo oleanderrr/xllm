@@ -90,8 +90,10 @@ if(USE_NPU)
     SRCS
       qwen3_slot_forward_test.cpp
     DEPS
-      :task_pipeline_model_input_binding
       :runtime
+      :prepared_sampler
+      :sampler
+      :task_pipeline_model_input_binding
       :models
       :model_loader
       :model_context

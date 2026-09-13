@@ -53,6 +53,8 @@ class ModelInputPreparer final {
   ModelInputPreparer(const ModelInputPreparer&) = delete;
   ModelInputPreparer& operator=(const ModelInputPreparer&) = delete;
 
+  Status validate(const ModelInputHostView& input) const;
+
   // Expected validation failures leave storage, event and info unchanged.
   // On success, source spans are no longer borrowed. Unused token/row capacity
   // is untouched and must not be consumed. Device failures are fatal.

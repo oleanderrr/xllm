@@ -33,6 +33,18 @@ struct ModelInputParams;
 
 void register_attention_metadata_views(pybind11::module_& module);
 
+// Owns only the Python attention metadata object. Destruction releases Python
+// references with the GIL; model inputs and execution remain in the Slot.
+class PythonAttentionMetadata final {
+ public:
+  explicit PythonAttentionMetadata(pybind11::object value);
+  // Caller holds the GIL, as for all Python view accessors in this file.
+  pybind11::object value() const;
+
+ private:
+  std::shared_ptr<void> object_holder_;
+};
+
 class PyExpandedDecodeMetadataView final {
  public:
   explicit PyExpandedDecodeMetadataView(
@@ -87,6 +99,8 @@ class PyAttentionMetadataView final {
   PyExpandedDecodeMetadataView expanded_decode_metadata() const;
   int64_t max_query_len() const;
   int64_t max_seq_len() const;
+  pybind11::object prepared_attention_state() const;
+  void set_prepared_attention_state(pybind11::object value);
   pybind11::object dsa_metadata() const;
   void set_dsa_metadata(pybind11::object value);
   pybind11::object dsa_positions() const;
@@ -118,6 +132,7 @@ class PyAttentionMetadataView final {
   torch::Tensor linear_state_indices_;
   std::vector<int32_t> dp_execution_token_counts_;
   std::vector<int32_t> dp_is_decode_;
+  std::shared_ptr<void> prepared_attention_holder_;
   std::shared_ptr<void> dsa_metadata_holder_;
   torch::Tensor dsa_positions_;
   torch::Tensor dsa_cos_sin_;

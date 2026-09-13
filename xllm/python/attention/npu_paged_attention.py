@@ -128,6 +128,14 @@ def _build_stable_sfa_page_layout(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedPagedAttention:
+    block_table: torch.Tensor | None
+    query_ends: list[int] | None
+    actual_seq_q: list[int]
+    actual_seq_kv: list[int]
+
+
 class NpuPagedAttentionBackend(AttentionBackend):
     """NPU attention backend dispatching to npu_fused_infer_attention_score."""
 
@@ -247,12 +255,63 @@ class NpuPagedAttentionBackend(AttentionBackend):
             "sequence or a leading zero plus one value per sequence"
         )
 
+    @property
+    def supports_prepared_metadata(self) -> bool:
+        return not self._is_mla
+
+    def prepare_metadata(self, metadata: AttentionMetadata) -> _PreparedPagedAttention:
+        """Prepare one ordinary Slot without Device work or active-state writes."""
+        expanded = getattr(metadata, "expanded_decode_metadata", None)
+        if (
+            self._is_mla
+            or getattr(metadata, "is_spec_verify", False)
+            or getattr(metadata, "has_kv_shard", False)
+            or (expanded is not None and expanded.enabled)
+        ):
+            raise ValueError("prepared paged metadata requires ordinary unsharded attention")
+        q_lens = metadata.q_seq_lens
+        if q_lens is None:
+            raise ValueError("prepared paged metadata requires query lengths")
+        batch_size = q_lens.numel()
+        query_ends = getattr(metadata, "q_cu_seq_lens_host_values", None)
+        if query_ends is None:
+            raise ValueError("prepared paged metadata requires Host query ends")
+        if len(query_ends) == batch_size + 1 and query_ends[0] == 0:
+            query_ends = query_ends[1:]
+        if len(query_ends) != batch_size:
+            raise ValueError("prepared Host query ends must match the batch")
+        block_table = metadata.block_table
+        actual_seq_q: list[int] = []
+        actual_seq_kv: list[int] = []
+        if block_table is not None:
+            if block_table.dtype != torch.int32 or not block_table.is_contiguous():
+                raise ValueError("prepared block table must already be contiguous int32")
+            if block_table.shape[0] != batch_size:
+                raise ValueError("prepared block table must match the batch")
+            kv_lengths = metadata.kv_seq_lens_host_values
+            if kv_lengths is None or len(kv_lengths) != batch_size:
+                raise ValueError("prepared Host KV lengths must match the batch")
+            actual_seq_q = list(range(1, batch_size + 1))
+            actual_seq_kv = list(kv_lengths)
+        return _PreparedPagedAttention(block_table, list(query_ends), actual_seq_q, actual_seq_kv)
+
     def prepare(
         self,
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
     ) -> None:
+        prepared = getattr(metadata, "prepared_attention_state", None)
+        if prepared is not None:
+            if graph_mode or self._is_mla or not isinstance(prepared, _PreparedPagedAttention):
+                raise ValueError("prepared paged state requires ordinary eager attention")
+            self._metadata = metadata
+            self._use_expanded_decode = False
+            self._block_table_i32 = prepared.block_table
+            self._actual_seq_lens = prepared.query_ends
+            self._actual_seq_q = prepared.actual_seq_q
+            self._actual_seq_kv = prepared.actual_seq_kv
+            return
         self._metadata = metadata
         expanded = resolve_expanded_decode_metadata(metadata, block_size=self.page_size)
         self._use_expanded_decode = expanded is not None
