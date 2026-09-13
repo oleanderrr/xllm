@@ -22,6 +22,16 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      model_input_binding_test
+    SRCS
+      model_input_binding_test.cpp
+    DEPS
+      :task_pipeline_model_input_binding
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
       model_input_preparer_test
     SRCS
       model_input_preparer_test.cpp

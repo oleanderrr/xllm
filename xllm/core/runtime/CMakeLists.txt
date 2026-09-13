@@ -17,6 +17,18 @@ cc_library(
 if(USE_NPU)
   cc_library(
     NAME
+      task_pipeline_model_input_binding
+    HDRS
+      task_pipeline/model_input_binding.h
+    SRCS
+      task_pipeline/model_input_binding.cpp
+    DEPS
+      :task_pipeline_model_input_preparer
+      :model
+  )
+
+  cc_library(
+    NAME
       task_pipeline_model_input_preparer
     HDRS
       task_pipeline/model_input_preparer.h
@@ -124,6 +136,7 @@ cc_library(
     forward_shared_memory_manager.cpp
   DEPS
     :task_pipeline_model_input_layout
+    $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_storage>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_preparer>
     torch
