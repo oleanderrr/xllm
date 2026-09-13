@@ -5,12 +5,14 @@ cc_library(
     xllm_ops
   HDRS
     xllm_ops_api.h
+    top_k_top_p_plan.h
     ../utils.h
   SRCS
     replace_token.cpp
     laser_attention.cpp
     mtp_prepare_next_draft.cpp
     top_k_top_p.cpp
+    top_k_top_p_plan.cpp
     quant_matmul.cpp
     quantize.cpp
     quant_dynamic.cpp

@@ -22,6 +22,22 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      top_k_top_p_plan_test
+    SRCS
+      top_k_top_p_plan_test.cpp
+    DEPS
+      :xllm_ops
+      :platform
+      GTest::gtest_main
+  )
+  target_link_libraries(top_k_top_p_plan_test PRIVATE nnopbase)
+  target_link_options(top_k_top_p_plan_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
+    NAME
       token_result_storage_test
     SRCS
       token_result_storage_test.cpp
