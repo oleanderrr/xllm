@@ -2,6 +2,16 @@ include(cc_test)
 
 cc_test(
   NAME
+    model_input_layout_test
+  SRCS
+    model_input_layout_test.cpp
+  DEPS
+    :task_pipeline_model_input_layout
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     acl_graph_bucket_policy_test
   SRCS
     acl_graph_bucket_policy_test.cpp

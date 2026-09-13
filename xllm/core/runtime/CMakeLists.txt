@@ -3,6 +3,19 @@ include(cc_binary)
 
 cc_library(
   NAME
+    task_pipeline_model_input_layout
+  HDRS
+    task_pipeline/model_input_layout.h
+  SRCS
+    task_pipeline/model_input_layout.cpp
+  DEPS
+    glog::glog
+    nlohmann_json::nlohmann_json
+    proto::xllm_proto
+)
+
+cc_library(
+  NAME
     runtime
   HDRS
     options.h
@@ -84,6 +97,7 @@ cc_library(
     dspark_worker_impl.cpp
     forward_shared_memory_manager.cpp
   DEPS
+    :task_pipeline_model_input_layout
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common
