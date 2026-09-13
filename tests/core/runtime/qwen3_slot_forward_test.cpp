@@ -300,8 +300,9 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
 
   std::unique_ptr<TaskExecutionPipeline> make_pipeline(
       ThreadPool& state,
-      torch::ScalarType parameter_dtype = torch::kBFloat16) {
-    auto program = make_program(/*slot_count=*/1, parameter_dtype);
+      torch::ScalarType parameter_dtype = torch::kBFloat16,
+      uint32_t slot_count = 1) {
+    auto program = make_program(slot_count, parameter_dtype);
     if (program == nullptr) {
       return nullptr;
     }
@@ -599,6 +600,152 @@ TEST_P(Qwen3SlotForwardTest, TwoSlotsShareWorkspaceAndKeepPrivateInputs) {
     for (uint32_t index = 0; index < retained.size(); ++index) {
       compare_result({Status(), retained[index]}, snapshots[index]);
     }
+    compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest, TwoSlotPipelineRetiresInOrderAndReusesStorage) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    auto first = make_batch({5, 3}, {5, 3});
+    auto second = make_batch({1, 1}, {6, 4});
+    auto third = make_batch({1, 1}, {7, 5});
+    auto first_params = sampling_for(first, /*mode=*/0);
+    auto second_params = sampling_for(second, /*mode=*/1);
+    auto third_params = sampling_for(third, /*mode=*/2);
+    auto rng_before = pipeline_rng_state();
+    auto expected_first = reference(
+        first, BatchForwardType::PREFILL, first_params, parameter_dtype);
+    auto expected_second = reference(
+        second, BatchForwardType::DECODE, second_params, parameter_dtype);
+    auto expected_third = reference(
+        third, BatchForwardType::DECODE, third_params, parameter_dtype);
+    auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    const auto a = pipeline->submit(
+        {view(first), {BatchForwardType::PREFILL, 2}, first_params});
+    ASSERT_TRUE(a.status.ok());
+    const auto b = pipeline->submit(
+        {view(second), {BatchForwardType::DECODE, 2}, second_params});
+    ASSERT_TRUE(b.status.ok());
+    EXPECT_GT(b.task_id, a.task_id);
+    EXPECT_EQ(
+        pipeline
+            ->submit({view(third), {BatchForwardType::DECODE, 2}, third_params})
+            .status.code(),
+        StatusCode::RESOURCE_EXHAUSTED);
+    // Prepare B completed without requesting Consume A. A later ticket must
+    // not steal the oldest completion, even when both kernels were submitted.
+    EXPECT_EQ(pipeline->take_result_async(b.task_id).get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    auto result_a = pipeline->take_result_async(a.task_id).get();
+    compare_result(result_a, expected_first);
+    auto invalid = third;
+    invalid.positions[0] = -1;
+    const auto rejected = pipeline->submit(
+        {view(invalid), {BatchForwardType::DECODE, 2}, third_params});
+    EXPECT_EQ(rejected.status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(rejected.task_id, 0);
+    const auto c = pipeline->submit(
+        {view(third), {BatchForwardType::DECODE, 2}, third_params});
+    ASSERT_TRUE(c.status.ok());
+    EXPECT_EQ(c.task_id, b.task_id + 1);
+    EXPECT_EQ(pipeline->submit({}).status.code(),
+              StatusCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(pipeline->take_result_async(a.task_id).get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(pipeline->take_result_async(c.task_id).get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    auto result_b = pipeline->take_result_async(b.task_id).get();
+    auto result_c = pipeline->take_result_async(c.task_id).get();
+    compare_result(result_b, expected_second);
+    compare_result(result_c, expected_third);
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    BatchData empty;
+    const auto last =
+        pipeline->submit({view(empty), {BatchForwardType::EMPTY, 0}, {}});
+    ASSERT_TRUE(last.status.ok());
+    auto empty_result = pipeline->take_result_async(last.task_id).get();
+    EXPECT_TRUE(empty_result.status.ok());
+    EXPECT_FALSE(empty_result.tokens.tokens.defined());
+    pipeline.reset();
+    compare_result(result_a, expected_first);
+    compare_result(result_b, expected_second);
+    compare_result(result_c, expected_third);
+    compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest, TwoSlotPipelineDrainsUnclaimedAndPendingResults) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    ThreadPool state(/*num_threads=*/1);
+    auto first = make_batch({5, 3}, {5, 3});
+    auto second = make_batch({1, 1}, {6, 4});
+    auto first_params = sampling_for(first, /*mode=*/1);
+    auto second_params = sampling_for(second, /*mode=*/2);
+    for (int32_t pending = 0; pending <= 2; ++pending) {
+      SCOPED_TRACE(pending);
+      auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+      ASSERT_NE(pipeline, nullptr);
+      auto rng_before = pipeline_rng_state();
+      if (pending >= 1) {
+        reference(
+            first, BatchForwardType::PREFILL, first_params, parameter_dtype);
+      }
+      if (pending == 2) {
+        reference(
+            second, BatchForwardType::DECODE, second_params, parameter_dtype);
+      }
+      auto expected_rng = pipeline_rng_state();
+      restore_pipeline_rng(rng_before);
+      if (pending >= 1) {
+        ASSERT_TRUE(
+            pipeline
+                ->submit(
+                    {view(first), {BatchForwardType::PREFILL, 2}, first_params})
+                .status.ok());
+      }
+      if (pending == 2) {
+        ASSERT_TRUE(pipeline
+                        ->submit({view(second),
+                                  {BatchForwardType::DECODE, 2},
+                                  second_params})
+                        .status.ok());
+      }
+      pipeline.reset();
+      EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+      compare_kv();
+    }
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    auto rng_before = pipeline_rng_state();
+    auto expected_first = reference(
+        first, BatchForwardType::PREFILL, first_params, parameter_dtype);
+    auto expected_second = reference(
+        second, BatchForwardType::DECODE, second_params, parameter_dtype);
+    auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    const auto a = pipeline->submit(
+        {view(first), {BatchForwardType::PREFILL, 2}, first_params});
+    const auto b = pipeline->submit(
+        {view(second), {BatchForwardType::DECODE, 2}, second_params});
+    ASSERT_TRUE(a.status.ok());
+    ASSERT_TRUE(b.status.ok());
+    auto future_a = pipeline->take_result_async(a.task_id);
+    auto future_b = pipeline->take_result_async(b.task_id);
+    auto duplicate = pipeline->take_result_async(a.task_id);
+    pipeline.reset();
+    compare_result(std::move(future_a).get(), expected_first);
+    compare_result(std::move(future_b).get(), expected_second);
+    EXPECT_EQ(std::move(duplicate).get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
     compare_kv();
   }
 }

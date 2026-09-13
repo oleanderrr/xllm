@@ -23,10 +23,10 @@ Status TaskExecutionPipeline::create(
     ThreadPool& state_executor,
     std::unique_ptr<LlmTaskProgram> program,
     std::unique_ptr<TaskExecutionPipeline>& output) {
-  if (state_executor.size() != 1 || program == nullptr ||
-      program->slot_count() != 1) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "Task pipeline requires one state thread and one LLM Slot.");
+  if (state_executor.size() != 1 || program == nullptr) {
+    return Status(
+        StatusCode::INVALID_ARGUMENT,
+        "Task pipeline requires one state thread and an LLM program.");
   }
   output = std::unique_ptr<TaskExecutionPipeline>(
       new TaskExecutionPipeline(state_executor, std::move(program)));
@@ -36,7 +36,10 @@ Status TaskExecutionPipeline::create(
 TaskExecutionPipeline::TaskExecutionPipeline(
     ThreadPool& state_executor,
     std::unique_ptr<LlmTaskProgram> program)
-    : state_executor_(state_executor), program_(std::move(program)) {
+    : state_executor_(state_executor),
+      program_(std::move(program)),
+      execution_(program_->slot_count()),
+      completed_(program_->slot_count()) {
   folly::Promise<std::thread::id> promise;
   auto future = promise.getFuture();
   state_executor_.schedule([promise = std::move(promise)]() mutable {
@@ -57,22 +60,27 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmTaskInput& input) {
   auto future = promise.getFuture();
   state_executor_.schedule(
       [this, &input, promise = std::move(promise)]() mutable {
-        if (active_task_id_ != 0) {
+        if (accepted_.size() == program_->slot_count()) {
           promise.setValue(TaskSubmission{
               Status(StatusCode::RESOURCE_EXHAUSTED,
-                     "Task Slot still holds an unconsumed result."),
+                     "All task Slots still hold unconsumed results."),
               0});
           return;
         }
-        Status status = program_->prepare(/*slot_id=*/0, input);
+        // With at most two Slots, one remaining Task identifies the other
+        // free Slot. The accepted FIFO is the only Host ownership record.
+        const uint32_t slot_id =
+            accepted_.empty() ? 0U : 1U - accepted_.front().slot_id;
+        CHECK_LT(next_task_id_, std::numeric_limits<uint64_t>::max());
+        Status status = program_->prepare(slot_id, input);
         if (!status.ok()) {
           promise.setValue(TaskSubmission{std::move(status), 0});
           return;
         }
-        CHECK_LT(next_task_id_, std::numeric_limits<uint64_t>::max());
-        active_task_id_ = next_task_id_++;
-        execution_.push(program_.get());
-        promise.setValue(TaskSubmission{Status(), active_task_id_});
+        const SlotTicket ticket{slot_id, next_task_id_++};
+        accepted_.emplace_back(ticket);
+        execution_.push(ticket);
+        promise.setValue(TaskSubmission{Status(), ticket.task_id});
       });
   return std::move(future).get();
 }
@@ -84,26 +92,40 @@ folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
   auto future = promise.getFuture();
   state_executor_.schedule(
       [this, task_id, promise = std::move(promise)]() mutable {
-        if (task_id == 0 || task_id != active_task_id_) {
+        if (task_id == 0 || accepted_.empty() ||
+            task_id != accepted_.front().task_id) {
           promise.setValue(
               TaskResult{Status(StatusCode::INVALID_ARGUMENT,
-                                "No unconsumed result for this TaskId."),
+                                "TaskId is not the oldest unconsumed task."),
                          {}});
           return;
         }
-        CHECK_EQ(completed_.pop(), program_.get());
-        auto tokens = program_->consume(/*slot_id=*/0);
-        active_task_id_ = 0;
+        const SlotTicket ticket = wait_completed_front();
+        auto tokens = program_->consume(ticket.slot_id);
+        accepted_.pop_front();
         promise.setValue(TaskResult{Status(), std::move(tokens)});
       });
   return future;
 }
 
+TaskExecutionPipeline::SlotTicket
+TaskExecutionPipeline::wait_completed_front() {
+  CHECK(!accepted_.empty());
+  const SlotTicket ticket = completed_.pop();
+  CHECK_EQ(ticket.task_id, accepted_.front().task_id);
+  CHECK_EQ(ticket.slot_id, accepted_.front().slot_id);
+  return ticket;
+}
+
 void TaskExecutionPipeline::launch_loop() {
-  while (LlmTaskProgram* program = execution_.pop()) {
-    program->launch(/*slot_id=*/0);
-    // At most one accepted Task: publishing never depends on GetLast.
-    completed_.push(program);
+  while (true) {
+    const SlotTicket ticket = execution_.pop();
+    if (ticket.task_id == 0) {
+      return;
+    }
+    program_->launch(ticket.slot_id);
+    // The completion queue covers every Slot, including unrequested results.
+    completed_.push(ticket);
   }
 }
 
@@ -115,12 +137,12 @@ TaskExecutionPipeline::~TaskExecutionPipeline() {
     promise.setValue(folly::unit);
   });
   std::move(future).get();
-  execution_.push(nullptr);
+  execution_.push(SlotTicket{});
   launch_thread_.join();
-  if (active_task_id_ != 0) {
-    CHECK_EQ(completed_.pop(), program_.get());
-    program_->discard(/*slot_id=*/0);
-    active_task_id_ = 0;
+  while (!accepted_.empty()) {
+    const SlotTicket ticket = wait_completed_front();
+    program_->discard(ticket.slot_id);
+    accepted_.pop_front();
   }
   CHECK(completed_.empty());
 }

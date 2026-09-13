@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <folly/futures/Future.h>
 
+#include <deque>
+
 #include "core/runtime/task_pipeline/llm_task_program.h"
 #include "core/util/concurrent_queue.h"
 #include "core/util/threadpool.h"
@@ -33,7 +35,7 @@ struct TaskResult {
   TokenResultTensors tokens;
 };
 
-// Single-Slot eager baseline. The owner prevents external calls racing with
+// One or two eager Slots. The owner prevents external calls racing with
 // destruction. State executor, model and KV all outlive this pipeline.
 // Public calls/destruction must occur outside its state/Launch threads.
 class TaskExecutionPipeline final {
@@ -48,27 +50,34 @@ class TaskExecutionPipeline final {
   // Waits for Prepare Ack only. On success no caller input storage is still
   // borrowed. Backpressure and validation return before accepting a Task.
   TaskSubmission submit(const LlmTaskInput& input);
-  // Requests Consume on the existing state executor. Slot retirement precedes
+  // Only the oldest accepted TaskId may be consumed. Other IDs are rejected
+  // without removing a completion. Slot retirement precedes
   // Future completion. An unrequested result continues to occupy the Slot.
   folly::Future<TaskResult> take_result_async(uint64_t task_id);
   uint64_t pinned_bytes() const { return program_->pinned_bytes(); }
   uint64_t device_bytes() const { return program_->device_bytes(); }
 
  private:
+  struct SlotTicket {
+    uint32_t slot_id = 0;
+    uint64_t task_id = 0;
+  };
+
   TaskExecutionPipeline(ThreadPool& state_executor,
                         std::unique_ptr<LlmTaskProgram> program);
   void launch_loop();
+  SlotTicket wait_completed_front();
   void check_external_thread() const;
 
   ThreadPool& state_executor_;
   std::unique_ptr<LlmTaskProgram> program_;
-  ConcurrentQueue<LlmTaskProgram*> execution_{1};
-  ConcurrentQueue<LlmTaskProgram*> completed_{1};
+  ConcurrentQueue<SlotTicket> execution_;
+  ConcurrentQueue<SlotTicket> completed_;
   std::thread launch_thread_;
   std::thread::id state_thread_id_;
   // Accessed exclusively on the state executor until the destructor barrier.
   uint64_t next_task_id_ = 1;
-  uint64_t active_task_id_ = 0;
+  std::deque<SlotTicket> accepted_;
 };
 
 }  // namespace xllm
