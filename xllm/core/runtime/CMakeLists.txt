@@ -16,6 +16,13 @@ cc_library(
 
 if(USE_NPU)
   cc_library(
+    NAME task_pipeline_sequence_state_pool
+    HDRS task_pipeline/sequence_state_pool.h
+    SRCS task_pipeline/sequence_state_pool.cpp
+    DEPS :sequence_state_key :platform absl::flat_hash_map
+  )
+
+  cc_library(
     NAME
       task_pipeline_token_result_storage
     HDRS

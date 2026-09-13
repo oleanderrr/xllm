@@ -2,6 +2,11 @@ include(cc_library)
 include(cc_binary)
 
 cc_library(
+  NAME sequence_state_key
+  HDRS sequence_state_key.h
+)
+
+cc_library(
   NAME 
     request
   HDRS
