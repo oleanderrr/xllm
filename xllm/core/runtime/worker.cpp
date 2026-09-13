@@ -16,6 +16,15 @@ limitations under the License.
 
 #include "worker.h"
 
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
+#if defined(USE_NPU)
+#include "core/runtime/task_pipeline/llm_task_adapter.h"
+#include "core/runtime/task_pipeline/task_execution_pipeline.h"
+#endif
+
 #include <folly/Unit.h>
 #include <folly/futures/Future.h>
 #include <glog/logging.h>
@@ -49,7 +58,32 @@ namespace xllm {
 Worker::Worker(const ParallelArgs& parallel_args,
                const torch::Device& device,
                const runtime::Options& options,
-               WorkerType worker_type) {
+               WorkerType worker_type)
+    : task_pipeline_slots_(options.task_pipeline_slots()) {
+  CHECK_GE(task_pipeline_slots_, 0);
+  CHECK_LE(task_pipeline_slots_, 1);
+  if (task_pipeline_slots_ != 0) {
+#if !defined(USE_NPU)
+    LOG(FATAL) << "Task execution pipeline requires NPU.";
+#endif
+    CHECK(ModelConfig::is_python_model_impl(
+        ModelConfig::get_instance().model_impl()))
+        << "Task pipeline requires the Python model implementation.";
+    CHECK(worker_type == WorkerType::LLM && options.task_type() == "generate" &&
+          !options.enable_speculative_decode() &&
+          !options.enable_schedule_overlap() && !options.enable_graph() &&
+          !options.enable_prefill_piecewise_graph() &&
+          !options.enable_disagg_pd() && options.host_blocks_factor() <= 1.0 &&
+          !options.enable_kvcache_store() && !options.enable_sleep_mode() &&
+          !options.enable_offline_inference() &&
+          !EPLBConfig::get_instance().enable_eplb() &&
+          !KVCacheConfig::get_instance().enable_xtensor() &&
+          !LoadConfig::get_instance().enable_rolling_load() &&
+          parallel_args.world_size() == 1 && parallel_args.dp_size() == 1 &&
+          parallel_args.cp_size() == 1 && parallel_args.ep_size() == 1)
+        << "Task pipeline currently requires single-rank ordinary eager LLM, "
+           "without overlap, offload, disaggregation or sleep.";
+  }
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
     LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
@@ -90,12 +124,44 @@ Worker::Worker(const ParallelArgs& parallel_args,
   }
 }
 
-Worker::~Worker() { delete impl_; }
+Worker::~Worker() {
+  if (task_pipeline_slots_ != 0) {
+    folly::Promise<folly::Unit> promise;
+    auto future = promise.getFuture();
+    threadpool_.schedule([promise = std::move(promise)]() mutable {
+      promise.setValue(folly::unit);
+    });
+    std::move(future).get();
+#if defined(USE_NPU)
+    task_pipeline_.reset();
+#endif
+  }
+  delete impl_;
+}
+
+bool Worker::initialize_task_pipeline() {
+  if (task_pipeline_slots_ == 0) {
+    return true;
+  }
+#if defined(USE_NPU)
+  CHECK(task_pipeline_ == nullptr);
+  const Status status = impl_->create_task_pipeline(task_pipeline_);
+  if (!status.ok()) {
+    LOG(ERROR) << status.message();
+    return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
 
 bool Worker::init_model(const std::string& model_weights_path,
                         int32_t random_seed,
                         MasterStatus master_status) {
-  return impl_->init_model(model_weights_path, random_seed, master_status);
+  CHECK(task_pipeline_slots_ == 0 || master_status == MasterStatus::WAKEUP);
+  return impl_->init_model(model_weights_path, random_seed, master_status) &&
+         initialize_task_pipeline();
 }
 
 bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
@@ -144,6 +210,9 @@ ForwardInput Worker::prepare_inputs(Batch& batch) {
 }
 
 std::optional<ForwardOutput> Worker::step(const ForwardInput& inputs) {
+  if (task_pipeline_slots_ != 0) {
+    return std::move(step_async(inputs)).get();
+  }
   return impl_->step(inputs);
 }
 
@@ -156,6 +225,40 @@ Worker::estimate_kv_cache_capacity_async() {
 
 folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
     const ForwardInput& inputs) {
+#if defined(USE_NPU)
+  if (task_pipeline_slots_ != 0) {
+    CHECK(task_pipeline_ != nullptr);
+    ForwardInput unpacked;
+    const ForwardInput* source = &inputs;
+    if (inputs.input_host_buffer_has_layout) {
+      CHECK(detail::unpack_from_input_host_buffer(
+          inputs, impl_->device(), unpacked));
+      source = &unpacked;
+    }
+    LlmTaskInput input;
+    Status status = make_llm_task_input(*source, input);
+    CHECK(status.ok()) << status.message();
+    const TaskSubmission submission = task_pipeline_->submit(input);
+    CHECK(submission.status.ok()) << submission.status.message();
+    // Speculative consumers are gated off, but preserve the ordinary output
+    // metadata as a detached CPU value before releasing the transport views.
+    torch::Tensor do_sample = input.sampling.do_sample.defined()
+                                  ? input.sampling.do_sample.clone()
+                                  : torch::Tensor();
+    return task_pipeline_->take_result_async(submission.task_id)
+        .thenValue(
+            [do_sample = std::move(do_sample),
+             is_warmup = source->input_params.meta.is_graph_warmup](
+                TaskResult result) mutable -> std::optional<ForwardOutput> {
+              CHECK(result.status.ok()) << result.status.message();
+              auto output = make_llm_task_output(std::move(result.tokens));
+              output.do_sample = std::move(do_sample);
+              output.is_graph_warmup = is_warmup;
+              return output;
+            })
+        .semi();
+  }
+#endif
   return impl_->step_async(inputs);
 }
 
@@ -168,8 +271,25 @@ folly::SemiFuture<bool> Worker::init_model_async(
     const std::string& model_weights_path,
     int32_t random_seed,
     MasterStatus master_status) {
-  return impl_->init_model_async(
-      model_weights_path, random_seed, master_status);
+  CHECK(task_pipeline_slots_ == 0 || master_status == MasterStatus::WAKEUP);
+  if (task_pipeline_slots_ == 0) {
+    return impl_->init_model_async(
+        model_weights_path, random_seed, master_status);
+  }
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        model_weights_path,
+                        random_seed,
+                        master_status,
+                        promise = std::move(promise)]() mutable {
+    const bool loaded =
+        std::move(impl_->init_model_async(
+                      model_weights_path, random_seed, master_status))
+            .get();
+    promise.setValue(loaded && initialize_task_pipeline());
+  });
+  return future;
 }
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_async(
@@ -210,6 +330,8 @@ const torch::Device& Worker::device() const { return impl_->device(); }
 
 folly::SemiFuture<std::optional<ForwardOutput>>
 Worker::get_last_step_result_async() {
+  CHECK_EQ(task_pipeline_slots_, 0)
+      << "Single-Slot task results are returned by step_async, not GetLast.";
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, promise = std::move(promise)]() mutable {
@@ -232,14 +354,26 @@ folly::SemiFuture<int64_t> Worker::get_active_activation_memory_async() {
 }
 
 bool Worker::sleep(MasterStatus master_status) {
+  if (task_pipeline_slots_ != 0) {
+    LOG(ERROR) << "Task pipeline resource rebuild is not supported yet.";
+    return false;
+  }
   return impl_->sleep(master_status);
 }
 
 bool Worker::wakeup(const WakeupOptions& options) {
+  if (task_pipeline_slots_ != 0) {
+    LOG(ERROR) << "Task pipeline resource rebuild is not supported yet.";
+    return false;
+  }
   return impl_->wakeup(options);
 }
 
 bool Worker::update_weights(const std::string& weights_path) {
+  if (task_pipeline_slots_ != 0) {
+    LOG(ERROR) << "Task pipeline resource rebuild is not supported yet.";
+    return false;
+  }
   return impl_->update_weights(weights_path);
 }
 

@@ -429,6 +429,15 @@ Master::Master(const Options& options, EngineType type)
     : options_(options),
       engine_type_(type),
       master_status_(options.master_status()) {
+  CHECK_GE(options_.task_pipeline_slots(), 0);
+  CHECK_LE(options_.task_pipeline_slots(), 1);
+  if (options_.task_pipeline_slots() != 0) {
+    CHECK(type == EngineType::LLM && options_.task_type() == "generate" &&
+          !options_.enable_offline_inference())
+        << "Task pipeline currently requires online ordinary LLM generation.";
+    CHECK(master_status_ == MasterStatus::WAKEUP)
+        << "Task pipeline must start with loaded weights.";
+  }
   const auto model_path =
       std::filesystem::path(options_.model_path()).lexically_normal();
   if (options_.host_blocks_factor() > 1.0) {
@@ -578,6 +587,7 @@ Master::Master(const Options& options, EngineType type)
         .ep_size(options.ep_size())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
         .max_seqs_per_batch(options_.max_seqs_per_batch())
+        .task_pipeline_slots(options_.task_pipeline_slots())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -674,6 +684,7 @@ Master::Master(const Options& options, EngineType type)
         .input_shm_size(options_.input_shm_size() * 1024 * 1024)
         .output_shm_size(options_.output_shm_size() * 1024 * 1024)
         .is_local(options_.is_local())
+        .task_pipeline_slots(options_.task_pipeline_slots())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -740,6 +751,7 @@ Master::Master(const Options& options, EngineType type)
         .output_shm_size(options_.output_shm_size() * 1024 * 1024)
         .is_local(options_.is_local())
         .server_idx(options_.server_idx())
+        .task_pipeline_slots(options_.task_pipeline_slots())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -782,6 +794,7 @@ Master::Master(const Options& options, EngineType type)
         .max_seqs_per_batch(options_.max_seqs_per_batch())
         .beam_width(options_.beam_width())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
+        .task_pipeline_slots(options_.task_pipeline_slots())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())

@@ -41,7 +41,8 @@ class ExecutionConfig final {
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
-        {"enable_graph",
+        {"task_pipeline_slots",
+         "enable_graph",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -58,6 +59,9 @@ class ExecutionConfig final {
          "enable_fia_decode"}};
     return kOptionCategory;
   }
+
+  // 0 uses the existing executor; 1 enables the single-Slot task pipeline.
+  PROPERTY(int32_t, task_pipeline_slots) = 0;
 
   PROPERTY(bool, enable_graph) = false;
 

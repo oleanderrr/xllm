@@ -26,11 +26,13 @@ limitations under the License.
 #include "common/rate_limiter.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
+#include "core/framework/config/execution_config.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request_output.h"
 #include "framework/request/request_params.h"
 #include "framework/tokenizer/tokenizer.h"
+#include "util/scope_guard.h"
 
 namespace xllm {
 namespace {
@@ -331,6 +333,112 @@ TEST_F(LLMRequestFactoryTest, MessageOverloadCreatesRequestOnSuccess) {
   ASSERT_NE(request, nullptr);
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest,
+       PipelineRejectsBeamAndAcceptsNextOrdinaryRequest) {
+  auto& config = ExecutionConfig::get_instance();
+  const int32_t previous_slots = config.task_pipeline_slots();
+  ScopeGuard restore_config([&config, previous_slots] {
+    config.task_pipeline_slots(previous_slots);
+  });
+  config.task_pipeline_slots(/*value=*/0);
+  options_.task_pipeline_slots(/*value=*/1);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.request_id = "pipeline-beam";
+  sp.max_tokens = 16;
+  sp.beam_width = 2;
+  ASSERT_TRUE(sp.verify_params(make_capture_callback(&capture)));
+
+  auto request = factory->create(/*prompt=*/"hi",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(capture.status->message(),
+            "Task pipeline does not yet support beam search or structured "
+            "output constraints");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+
+  // Rejection must release the caller's quota and leave ordinary admission
+  // usable.
+  EXPECT_FALSE(rate_limiter_.is_limited());
+  capture = {};
+  sp.beam_width = 0;
+  request = factory->create(/*prompt=*/"hi",
+                            /*prompt_tokens=*/std::nullopt,
+                            sp,
+                            /*call=*/std::nullopt,
+                            make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  request.reset();
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, PipelineRejectsStructuredChatAndReleasesQuota) {
+  auto& config = ExecutionConfig::get_instance();
+  const int32_t previous_slots = config.task_pipeline_slots();
+  ScopeGuard restore_config([&config, previous_slots] {
+    config.task_pipeline_slots(previous_slots);
+  });
+  config.task_pipeline_slots(/*value=*/0);
+  options_.task_pipeline_slots(/*value=*/1);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.request_id = "pipeline-json";
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+  ASSERT_TRUE(sp.verify_params(make_capture_callback(&capture)));
+  const std::vector<Message> messages = {Message("user", std::string("hi"))};
+
+  auto request = factory->create(messages,
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(capture.status->message(),
+            "Task pipeline does not yet support beam search or structured "
+            "output constraints");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, LegacyBeamIgnoresGlobalPipelineSetting) {
+  auto& config = ExecutionConfig::get_instance();
+  const int32_t previous_slots = config.task_pipeline_slots();
+  ScopeGuard restore_config([&config, previous_slots] {
+    config.task_pipeline_slots(previous_slots);
+  });
+  config.task_pipeline_slots(/*value=*/1);
+  options_.task_pipeline_slots(/*value=*/0);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.request_id = "legacy-beam";
+  sp.max_tokens = 16;
+  sp.beam_width = 2;
+  ASSERT_TRUE(sp.verify_params(make_capture_callback(&capture)));
+
+  auto request = factory->create(/*prompt=*/"hi",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  request.reset();
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
 }  // namespace

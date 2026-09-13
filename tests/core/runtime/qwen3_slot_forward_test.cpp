@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/framework/model_context.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/framework/tokenizer/tokenizer.h"
 #include "core/runtime/executor.h"
 #include "core/runtime/task_pipeline/model_input_binding.h"
 #include "core/runtime/task_pipeline/task_execution_pipeline.h"
@@ -97,7 +98,9 @@ ModelInputHostView view(const BatchData& batch) {
           batch.kv,
           batch.cumulative,
           batch.blocks,
-          batch.q.empty() ? 0U : 1U};
+          batch.q.empty()
+              ? 0U
+              : static_cast<uint32_t>(batch.blocks.size() / batch.q.size())};
 }
 
 class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
@@ -125,6 +128,8 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
 
     auto loader = ModelLoader::create(model_path);
     ASSERT_NE(loader, nullptr);
+    tokenizer_ = loader->tokenizer();
+    ASSERT_NE(tokenizer_, nullptr);
     args_ = loader->model_args();
     ASSERT_EQ(args_.model_type(), "qwen3");
     args_.dtype("bfloat16");
@@ -266,7 +271,9 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     }
   }
 
-  std::unique_ptr<TaskExecutionPipeline> make_pipeline(ThreadPool& state) {
+  std::unique_ptr<TaskExecutionPipeline> make_pipeline(
+      ThreadPool& state,
+      torch::ScalarType parameter_dtype = torch::kBFloat16) {
     auto rng_before = pipeline_rng_state();
     LlmTaskCapacity capacity;
     capacity.model = {32, 3, 2};
@@ -277,7 +284,7 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     capacity.hidden_size = args_.hidden_size();
     capacity.max_unique_tokens = 32;
     capacity.max_top_logprobs = 5;
-    capacity.parameter_dtype = torch::kBFloat16;
+    capacity.parameter_dtype = parameter_dtype;
     capacity.chunked_prefill = GetParam();
     std::unique_ptr<LlmTaskProgram> program;
     Status status = LlmTaskProgram::create(
@@ -326,23 +333,43 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
 
   SampleOutput reference(const BatchData& batch,
                          BatchForwardType phase,
-                         const SamplingParameters& params) {
-    auto& binding = *bindings_[0];
-    const Status status = binding.prepare(
-        view(batch), {phase, static_cast<uint32_t>(batch.q.size())}, *prepare_);
-    EXPECT_TRUE(status.ok()) << status.message();
+                         const SamplingParameters& params,
+                         torch::ScalarType parameter_dtype = torch::kBFloat16) {
+    // Build the reference with the original variable-width input preparation,
+    // independently of the Slot layout and its padded page-table capacity.
+    ModelInputParams reference_params;
+    auto& host = reference_params.attention.host;
+    host.q_seq_lens = batch.q;
+    host.kv_seq_lens = batch.kv;
+    host.q_cu_seq_lens = batch.cumulative;
+    host.new_cache_slots = batch.slots;
+    host.kv_cache_tokens_nums.resize(batch.q.size());
+    for (uint32_t row = 0; row < batch.q.size(); ++row) {
+      host.kv_cache_tokens_nums[row] = batch.kv[row] - batch.q[row];
+    }
+    host.block_tables =
+        torch::tensor(batch.blocks, torch::kInt32)
+            .view({static_cast<int64_t>(batch.q.size()),
+                   static_cast<int64_t>(batch.blocks.size() / batch.q.size())});
+    reference_params.meta.batch_forward_type = phase;
+    reference_params.meta.num_sequences = static_cast<int32_t>(batch.q.size());
+    reference_params.meta.actual_num_sequences =
+        static_cast<int32_t>(batch.q.size());
+    reference_params.meta.q_max_seq_len =
+        *std::max_element(batch.q.begin(), batch.q.end());
+    reference_params.meta.kv_max_seq_len =
+        *std::max_element(batch.kv.begin(), batch.kv.end());
+    EXPECT_TRUE(reference_params.attention.rebuild_device_buffer(device_));
+    auto tokens = torch::tensor(batch.tokens, torch::kInt32).to(device_);
+    auto positions = torch::tensor(batch.positions, torch::kInt32).to(device_);
     Stream original(c10_npu::getCurrentNPUStream(device_.index()));
-    EXPECT_TRUE(original.wait_event(binding.ready_event()));
-    ModelInputParams reference_params = binding.params();
-    reference_params.attn_metadata.reset();
-    reference_params.python_attention_metadata.reset();
     ModelOutput model_output = eager_executor_->forward(
-        binding.tokens(), binding.positions(), eager_kv_, reference_params);
+        tokens, positions, eager_kv_, reference_params);
     if (!params.selected_token_idxes.defined()) {
       EXPECT_EQ(original.synchronize(), 0);
       return {};
     }
-    auto device_params = params.to(device_, torch::kBFloat16);
+    auto device_params = params.to(device_, parameter_dtype);
     auto logits = model_->logits(model_output.hidden_states,
                                  device_params.selected_token_idxes);
     // Retain the native top-p conversion across Legacy's raw ACL submission,
@@ -382,6 +409,7 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
   const torch::TensorOptions options_ =
       torch::dtype(torch::kBFloat16).device(device_);
   ModelArgs args_;
+  std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<ProcessGroup> process_group_;
   std::unique_ptr<ModelContext> context_;
   std::unique_ptr<CausalLM> model_;
@@ -571,6 +599,143 @@ TEST_P(Qwen3SlotForwardTest, PipelineEmptyAndChunkedPrefillWithoutSampling) {
     compare_result(pipeline->take_result_async(submitted.task_id).get(),
                    expected);
   }
+  compare_kv();
+}
+
+// Replay the service benchmark prompt with a controlled row schedule.
+// Non-chunked uses four rows; chunked varies one to four rows with mixed
+// prefill/decode. Reference page tables grow independently from Slot storage.
+TEST_P(Qwen3SlotForwardTest, PipelineFixedFourRowServingSchedule) {
+  SchedulerConfig::get_instance().max_tokens_per_batch(/*value=*/512);
+  KVCacheCapacity kv_capacity;
+  kv_capacity.n_blocks(/*value=*/8);
+  kv_capacity.block_size(/*value=*/128);
+  const KVCacheShape shape(kv_capacity, args_, /*world_size=*/1);
+  KVCacheCreateOptions cache_options;
+  cache_options.device(device_);
+  cache_options.dtype(torch::kBFloat16);
+  cache_options.num_layers(args_.n_layers());
+  cache_options.model_type(args_.model_type());
+  eager_kv_.clear();
+  prepared_kv_.clear();
+  for (int32_t layer = 0; layer < args_.n_layers(); ++layer) {
+    eager_kv_.emplace_back(shape, cache_options, layer);
+    prepared_kv_.emplace_back(shape, cache_options, layer);
+    eager_kv_.back().get_k_cache().zero_();
+    eager_kv_.back().get_v_cache().zero_();
+    prepared_kv_.back().get_k_cache().zero_();
+    prepared_kv_.back().get_v_cache().zero_();
+  }
+  ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+  LlmTaskCapacity capacity;
+  capacity.model = {512, 4, 320};
+  capacity.max_kv_seq_len = 256;
+  capacity.max_positions = 256;
+  capacity.block_size = 128;
+  capacity.vocab_size = args_.vocab_size();
+  capacity.hidden_size = args_.hidden_size();
+  capacity.max_unique_tokens = 32;
+  capacity.max_top_logprobs = 5;
+  capacity.parameter_dtype = torch::kBFloat16;
+  capacity.chunked_prefill = GetParam();
+  std::unique_ptr<LlmTaskProgram> program;
+  ASSERT_TRUE(LlmTaskProgram::create(
+                  *model_, *slot_executor_, prepared_kv_, capacity, program)
+                  .ok());
+  ThreadPool state(/*num_threads=*/1);
+  std::unique_ptr<TaskExecutionPipeline> pipeline;
+  ASSERT_TRUE(
+      TaskExecutionPipeline::create(state, std::move(program), pipeline).ok());
+  std::string prompt;
+  for (int32_t repeat = 0; repeat < 12; ++repeat) {
+    prompt += "Explain how a CPU pipeline improves instruction throughput. ";
+  }
+  std::vector<int32_t> prompt_tokens;
+  ASSERT_TRUE(tokenizer_->encode(prompt, &prompt_tokens));
+  ASSERT_EQ(prompt_tokens.size(), 110);
+  std::array<int32_t, 4> lengths{};
+  std::array<int32_t, 4> previous{};
+  for (int32_t step = 0; step < 64; ++step) {
+    SCOPED_TRACE(step);
+    const int32_t rows = GetParam() ? 1 + step % 4 : 4;
+    std::vector<int32_t> q;
+    std::vector<int32_t> kv;
+    q.reserve(rows);
+    kv.reserve(rows);
+    for (int32_t row = 0; row < rows; ++row) {
+      const int32_t query =
+          lengths[row] == 0 ? static_cast<int32_t>(prompt_tokens.size()) : 1;
+      q.emplace_back(query);
+      lengths[row] += query;
+      kv.emplace_back(lengths[row]);
+    }
+    auto batch = make_batch(std::move(q), std::move(kv));
+    const int32_t columns =
+        (*std::max_element(batch.kv.begin(), batch.kv.end()) + 127) / 128;
+    batch.blocks.clear();
+    batch.blocks.reserve(rows * columns);
+    int32_t offset = 0;
+    for (int32_t row = 0; row < rows; ++row) {
+      for (int32_t column = 0; column < columns; ++column) {
+        batch.blocks.emplace_back(row * 2 + column);
+      }
+      for (int32_t index = 0; index < batch.q[row]; ++index, ++offset) {
+        batch.slots[offset] = row * 256 + batch.positions[offset];
+        batch.tokens[offset] =
+            batch.q[row] == 1 ? previous[row] : prompt_tokens[index];
+      }
+    }
+    auto params = sampling_for(batch, /*mode=*/0);
+    params.frequency_penalties.zero_();
+    params.presence_penalties.zero_();
+    params.repetition_penalties.fill_(/*value=*/1);
+    const bool has_prefill =
+        std::any_of(batch.q.begin(), batch.q.end(), [](int32_t query) {
+          return query > 1;
+        });
+    const BatchForwardType phase =
+        step == 0 ? BatchForwardType::PREFILL
+                  : (has_prefill ? BatchForwardType::MIXED
+                                 : BatchForwardType::DECODE);
+    auto expected = reference(batch, phase, params);
+    const auto task = pipeline->submit(
+        {view(batch), {phase, static_cast<uint32_t>(rows)}, params});
+    ASSERT_TRUE(task.status.ok()) << task.status.message();
+    auto result = pipeline->take_result_async(task.task_id).get();
+    compare_result(result, expected);
+    for (int32_t row = 0; row < rows; ++row) {
+      previous[row] = static_cast<int32_t>(
+          result.tokens.tokens.const_data_ptr<int64_t>()[row]);
+    }
+  }
+  pipeline.reset();
+  compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, PipelinePreservesShmSamplingPrecision) {
+  ThreadPool state(/*num_threads=*/1);
+  auto pipeline = make_pipeline(state, torch::kFloat32);
+  ASSERT_NE(pipeline, nullptr);
+  for (int32_t step = 0; step < 12; ++step) {
+    SCOPED_TRACE(step);
+    auto batch = step == 0 ? make_batch({5, 3}, {5, 3})
+                           : make_batch({1, 1}, {5 + step, 3 + step});
+    auto params = sampling_for(batch, step % 3);
+    const BatchForwardType phase =
+        step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE;
+    const auto rng_before = pipeline_rng_state();
+    auto expected = reference(batch, phase, params, torch::kFloat32);
+    const auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    const auto task = pipeline->submit({view(batch), {phase, 2}, params});
+    ASSERT_TRUE(task.status.ok()) << task.status.message();
+    params.temperatures.fill_(/*value=*/0.5);
+    params.frequency_penalties.zero_();
+    params.repetition_penalties.fill_(/*value=*/1.0);
+    compare_result(pipeline->take_result_async(task.task_id).get(), expected);
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+  }
+  pipeline.reset();
   compare_kv();
 }
 

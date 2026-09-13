@@ -85,6 +85,7 @@ cc_library(
     params_utils.h
     executor.h
     $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_program.h>
+    $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_adapter.h>
     $<$<BOOL:${USE_NPU}>:task_pipeline/task_execution_pipeline.h>
     executor_impl.h
     executor_impl_factory.h
@@ -125,6 +126,7 @@ cc_library(
     decode_graph_bucket.cpp
     executor.cpp
     $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_program.cpp>
+    $<$<BOOL:${USE_NPU}>:task_pipeline/llm_task_adapter.cpp>
     $<$<BOOL:${USE_NPU}>:task_pipeline/task_execution_pipeline.cpp>
     executor_impl_factory.cpp
     base_executor_impl.cpp

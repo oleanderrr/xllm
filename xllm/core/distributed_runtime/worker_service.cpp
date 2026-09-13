@@ -344,16 +344,18 @@ void WorkerService::step(
                         /*non_blocking=*/true);
           }
         };
-        if (use_default_stream) {
+        if (forward_outputs->cpu_ready) {
+          // Pipeline Consume already detached and completed every CPU result.
           copy_output_to_host();
         } else {
-          c10::StreamGuard stream_guard = stream_->set_stream_guard();
-          copy_output_to_host();
-        }
-        if (use_default_stream) {
-          device_.synchronize_default_stream();
-        } else {
-          stream_->synchronize();
+          if (use_default_stream) {
+            copy_output_to_host();
+            device_.synchronize_default_stream();
+          } else {
+            c10::StreamGuard stream_guard = stream_->set_stream_guard();
+            copy_output_to_host();
+            stream_->synchronize();
+          }
         }
         speculative_token_stats = record_speculative_metrics_from_output(
             next_tokens,
@@ -390,7 +392,9 @@ void WorkerService::create_polling_shm_thread(
           // the SHM polling thread. Keep scheduler overlap, but defer device
           // materialization to WorkerImpl's ordered prepare stream.
           const InputDeviceMaterializationPolicy materialization_policy =
-              options_.enable_schedule_overlap() && options_.enable_graph()
+              options_.task_pipeline_slots() != 0 ||
+                      (options_.enable_schedule_overlap() &&
+                       options_.enable_graph())
                   ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
                   : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
           input_shm_manager->input_read(

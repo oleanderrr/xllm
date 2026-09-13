@@ -287,6 +287,16 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
 
+  if (options_->task_pipeline_slots() != 0 &&
+      (sp.beam_width > 0 || sp.response_format != ResponseFormatType::NONE)) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Task pipeline does not yet support beam search or "
+                        "structured output constraints",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
+    return nullptr;
+  }
+
   const int32_t max_context_len = model_args_->max_position_embeddings();
 
   std::optional<std::vector<int>> encoded = encode_and_validate_prompt(

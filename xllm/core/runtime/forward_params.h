@@ -645,6 +645,9 @@ struct ForwardInput {
 
 // output after forward execution
 struct ForwardOutput {
+  // All result tensors are detached CPU values, ready without a Device event.
+  // Local runtime contract only; not serialized in proto or shared memory.
+  bool cpu_ready = false;
   // Local runtime handle, not in proto/shm; metrics recording skips warmup.
   bool is_graph_warmup = false;
   // sample parameters for speculative decoding

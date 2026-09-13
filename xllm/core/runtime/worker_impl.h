@@ -53,6 +53,9 @@ limitations under the License.
 namespace xllm {
 
 class WorkerRendezvous;
+#if defined(USE_NPU)
+class TaskExecutionPipeline;
+#endif
 
 class WorkerImpl {
  public:
@@ -67,6 +70,13 @@ class WorkerImpl {
              const runtime::Options& options);
 
   virtual ~WorkerImpl();
+
+#if defined(USE_NPU)
+  // Call outside the state executor, after weights load and before KV
+  // budgeting.
+  ::xllm::Status create_task_pipeline(
+      std::unique_ptr<TaskExecutionPipeline>& output);
+#endif
 
   // initialize model, cache manager. blocking call
   virtual bool init_model(ModelContext& context) = 0;

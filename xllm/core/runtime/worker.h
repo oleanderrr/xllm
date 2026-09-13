@@ -144,7 +144,12 @@ class Worker {
   folly::SemiFuture<int64_t> get_active_activation_memory_async();
 
  private:
+  bool initialize_task_pipeline();
+  int32_t task_pipeline_slots_ = 0;
   WorkerImpl* impl_ = nullptr;
+#if defined(USE_NPU)
+  std::unique_ptr<TaskExecutionPipeline> task_pipeline_;
+#endif
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,
                          /*pool_name=*/"Worker.async"};
