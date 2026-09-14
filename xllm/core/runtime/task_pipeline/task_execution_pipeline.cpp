@@ -80,6 +80,9 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmTaskInput& input) {
         const SlotTicket ticket{slot_id, next_task_id_++};
         accepted_.emplace_back(ticket);
         execution_.push(ticket);
+        VLOG(1) << "Task pipeline accepted task_id=" << ticket.task_id
+                << " slot_id=" << ticket.slot_id
+                << " pending=" << accepted_.size();
         promise.setValue(TaskSubmission{Status(), ticket.task_id});
       });
   return std::move(future).get();
@@ -114,6 +117,8 @@ folly::Future<TaskResult> TaskExecutionPipeline::take_result_impl(
     const SlotTicket ticket = wait_completed_front();
     auto output = program_->consume(ticket.slot_id);
     accepted_.pop_front();
+    VLOG(1) << "Task pipeline consumed task_id=" << ticket.task_id
+            << " slot_id=" << ticket.slot_id << " pending=" << accepted_.size();
     promise.setValue(TaskResult{Status(), std::move(output), ticket.task_id});
   });
   return future;

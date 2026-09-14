@@ -214,7 +214,8 @@ class Options {
   PROPERTY(bool, disable_ttft_profiling) = false;
   // true if enable forward interruption
   PROPERTY(bool, enable_forward_interruption) = false;
-  // 0 uses the existing executor; 1 enables the single-Slot task pipeline.
+  // 0 uses the existing executor; 1/2 use the task pipeline without/with
+  // scheduler overlap, respectively.
   PROPERTY(int32_t, task_pipeline_slots) = 0;
   PROPERTY(int32_t, task_pipeline_max_live_sequences) = 1024;
 

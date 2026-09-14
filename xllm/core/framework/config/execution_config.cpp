@@ -18,11 +18,11 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
-DEFINE_int32(
-    task_pipeline_slots,
-    0,
-    "Task execution pipeline Slots: 0 disables it, 1 enables the "
-    "single-rank NPU Python eager pipeline without scheduler overlap.");
+DEFINE_int32(task_pipeline_slots,
+             0,
+             "Task execution pipeline Slots: 0 disables it, 1 runs without "
+             "scheduler overlap, 2 requires scheduler overlap. "
+             "Single-rank NPU Python eager only.");
 
 DEFINE_int32(task_pipeline_max_live_sequences,
              1024,

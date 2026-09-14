@@ -265,7 +265,8 @@ struct Options {
   // if the model supports multiple version or there are multiple models.
   PROPERTY(int64_t, server_idx) = 0;
 
-  // 0 uses the existing executor; 1 enables the single-Slot task pipeline.
+  // 0 uses the existing executor; 1/2 use the task pipeline without/with
+  // scheduler overlap, respectively.
   PROPERTY(int32_t, task_pipeline_slots) = 0;
   PROPERTY(int32_t, task_pipeline_max_live_sequences) = 1024;
 

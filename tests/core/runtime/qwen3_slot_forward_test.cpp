@@ -824,7 +824,8 @@ TEST_P(Qwen3SlotForwardTest,
       if (step > 0) {
         // These values carry no row index: identity and position authorize
         // reads.
-        batches[step].tokens = {-7, -901};
+        batches[step].tokens = step % 2 == 0 ? std::vector<int32_t>{-1, -1}
+                                             : std::vector<int32_t>{-7, -901};
       }
       const auto accepted = pipeline->submit(
           {view(batches[step]),
@@ -844,7 +845,8 @@ TEST_P(Qwen3SlotForwardTest,
     submit(/*step=*/0);
     submit(/*step=*/1);
     for (uint32_t step = 0; step < kTasks; ++step) {
-      auto actual = pipeline->take_result_async(tickets[step]).get();
+      auto actual = pipeline->take_result_async().get();
+      ASSERT_EQ(actual.task_id, tickets[step]);
       compare_result(actual, expected[step]);
       snapshots.emplace_back(actual.output.tokens.tokens.clone());
       retained.emplace_back(std::move(actual.output.tokens));

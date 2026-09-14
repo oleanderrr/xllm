@@ -430,8 +430,11 @@ Master::Master(const Options& options, EngineType type)
       engine_type_(type),
       master_status_(options.master_status()) {
   CHECK_GE(options_.task_pipeline_slots(), 0);
-  CHECK_LE(options_.task_pipeline_slots(), 1);
+  CHECK_LE(options_.task_pipeline_slots(), 2);
   if (options_.task_pipeline_slots() != 0) {
+    CHECK_EQ(options_.task_pipeline_slots() == 2,
+             options_.enable_schedule_overlap())
+        << "Task pipeline requires scheduler overlap exactly when slots=2.";
     CHECK_GT(options_.task_pipeline_max_live_sequences(), 0)
         << "Task pipeline requires a positive live Sequence budget.";
     CHECK(type == EngineType::LLM && options_.task_type() == "generate" &&

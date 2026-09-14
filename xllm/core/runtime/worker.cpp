@@ -61,8 +61,10 @@ Worker::Worker(const ParallelArgs& parallel_args,
                WorkerType worker_type)
     : task_pipeline_slots_(options.task_pipeline_slots()) {
   CHECK_GE(task_pipeline_slots_, 0);
-  CHECK_LE(task_pipeline_slots_, 1);
+  CHECK_LE(task_pipeline_slots_, 2);
   if (task_pipeline_slots_ != 0) {
+    CHECK_EQ(task_pipeline_slots_ == 2, options.enable_schedule_overlap())
+        << "Task pipeline requires scheduler overlap exactly when slots=2.";
 #if !defined(USE_NPU)
     LOG(FATAL) << "Task execution pipeline requires NPU.";
 #endif
@@ -70,8 +72,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
         ModelConfig::get_instance().model_impl()))
         << "Task pipeline requires the Python model implementation.";
     CHECK(worker_type == WorkerType::LLM && options.task_type() == "generate" &&
-          !options.enable_speculative_decode() &&
-          !options.enable_schedule_overlap() && !options.enable_graph() &&
+          !options.enable_speculative_decode() && !options.enable_graph() &&
           !options.enable_prefill_piecewise_graph() &&
           !options.enable_disagg_pd() && options.host_blocks_factor() <= 1.0 &&
           !options.enable_kvcache_store() && !options.enable_sleep_mode() &&
@@ -82,7 +83,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           parallel_args.world_size() == 1 && parallel_args.dp_size() == 1 &&
           parallel_args.cp_size() == 1 && parallel_args.ep_size() == 1)
         << "Task pipeline currently requires single-rank ordinary eager LLM, "
-           "without overlap, offload, disaggregation or sleep.";
+           "without offload, disaggregation or sleep.";
   }
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
@@ -240,6 +241,10 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
     CHECK(status.ok()) << status.message();
     const TaskSubmission submission = task_pipeline_->submit(input);
     CHECK(submission.status.ok()) << submission.status.message();
+    if (task_pipeline_slots_ == 2) {
+      // PrepareAck releases all caller views. GetLast consumes the FIFO later.
+      return folly::makeSemiFuture(std::optional<ForwardOutput>{});
+    }
     return task_pipeline_->take_result_async(submission.task_id)
         .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
           CHECK(result.status.ok()) << result.status.message();
@@ -319,8 +324,19 @@ const torch::Device& Worker::device() const { return impl_->device(); }
 
 folly::SemiFuture<std::optional<ForwardOutput>>
 Worker::get_last_step_result_async() {
-  CHECK_EQ(task_pipeline_slots_, 0)
-      << "Single-Slot task results are returned by step_async, not GetLast.";
+#if defined(USE_NPU)
+  if (task_pipeline_slots_ != 0) {
+    CHECK_EQ(task_pipeline_slots_, 2)
+        << "Single-Slot task results are returned by step_async.";
+    CHECK(task_pipeline_ != nullptr);
+    return task_pipeline_->take_result_async()
+        .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
+          CHECK(result.status.ok()) << result.status.message();
+          return make_llm_task_output(std::move(result.output));
+        })
+        .semi();
+  }
+#endif
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this, promise = std::move(promise)]() mutable {
