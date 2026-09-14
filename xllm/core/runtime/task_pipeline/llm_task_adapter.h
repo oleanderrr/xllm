@@ -25,6 +25,6 @@ namespace xllm {
 Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output);
 
 // Tokens already own detached CPU storage. Only shape views are changed.
-ForwardOutput make_llm_task_output(TokenResultTensors tokens);
+ForwardOutput make_llm_task_output(LlmTaskOutput result);
 
 }  // namespace xllm

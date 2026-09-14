@@ -350,9 +350,26 @@ Status SamplingInputBinding::prepare(const SamplingParameters& input,
     prepared.return_probs = input.return_probs;
     prepared.max_top_logprobs = input.max_top_logprobs;
   }
+  cpu_do_sample_ = input.do_sample.defined()
+                       ? host_storage_.do_sample.narrow(
+                             /*dim=*/0, /*start=*/0, input.do_sample.numel())
+                       : torch::Tensor();
   params_ = std::move(prepared);
   transfer_ = transferred;
   return Status();
+}
+
+torch::Tensor SamplingInputBinding::copy_cpu_do_sample() const {
+  if (!cpu_do_sample_.defined()) {
+    return {};
+  }
+  auto output = torch::empty(cpu_do_sample_.sizes(),
+                             torch::TensorOptions()
+                                 .dtype(torch::kBool)
+                                 .device(torch::kCPU)
+                                 .pinned_memory(/*pinned_memory=*/false));
+  output.copy_(cpu_do_sample_);
+  return output;
 }
 
 }  // namespace xllm

@@ -87,24 +87,35 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmTaskInput& input) {
 
 folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
     uint64_t task_id) {
+  return take_result_impl(task_id);
+}
+
+folly::Future<TaskResult> TaskExecutionPipeline::take_result_async() {
+  return take_result_impl(std::nullopt);
+}
+
+folly::Future<TaskResult> TaskExecutionPipeline::take_result_impl(
+    std::optional<uint64_t> expected_task_id) {
   check_external_thread();
   folly::Promise<TaskResult> promise;
   auto future = promise.getFuture();
-  state_executor_.schedule(
-      [this, task_id, promise = std::move(promise)]() mutable {
-        if (task_id == 0 || accepted_.empty() ||
-            task_id != accepted_.front().task_id) {
-          promise.setValue(
-              TaskResult{Status(StatusCode::INVALID_ARGUMENT,
-                                "TaskId is not the oldest unconsumed task."),
-                         {}});
-          return;
-        }
-        const SlotTicket ticket = wait_completed_front();
-        auto tokens = program_->consume(ticket.slot_id);
-        accepted_.pop_front();
-        promise.setValue(TaskResult{Status(), std::move(tokens)});
-      });
+  state_executor_.schedule([this,
+                            expected_task_id,
+                            promise = std::move(promise)]() mutable {
+    if (accepted_.empty() ||
+        (expected_task_id.has_value() &&
+         (*expected_task_id == 0 ||
+          *expected_task_id != accepted_.front().task_id))) {
+      promise.setValue(TaskResult{Status(StatusCode::INVALID_ARGUMENT,
+                                         "No matching oldest unconsumed Task."),
+                                  {}});
+      return;
+    }
+    const SlotTicket ticket = wait_completed_front();
+    auto output = program_->consume(ticket.slot_id);
+    accepted_.pop_front();
+    promise.setValue(TaskResult{Status(), std::move(output), ticket.task_id});
+  });
   return future;
 }
 

@@ -284,6 +284,7 @@ Status LlmTaskProgram::prepare(uint32_t slot_id, const LlmTaskInput& input) {
                           slot.result->device().lengths,
                           slot.sampling);
   CHECK(status.ok()) << status.message();
+  slot.is_warmup = input.is_warmup;
   record(prepare_stream_, slot.input_ready);
   return Status();
 }
@@ -318,11 +319,14 @@ void LlmTaskProgram::launch(uint32_t slot_id) {
   CHECK(status.ok()) << status.message();
 }
 
-TokenResultTensors LlmTaskProgram::consume(uint32_t slot_id) {
+LlmTaskOutput LlmTaskProgram::consume(uint32_t slot_id) {
   CHECK_LT(slot_id, slots_.size());
   Slot& slot = *slots_[slot_id];
   c10::DeviceGuard guard(device_);
-  TokenResultTensors result = slot.result->take_result();
+  LlmTaskOutput result;
+  result.tokens = slot.result->take_result();
+  result.do_sample = slot.sampling_input->copy_cpu_do_sample();
+  result.is_warmup = slot.is_warmup;
   release_outputs(slot);
   return result;
 }

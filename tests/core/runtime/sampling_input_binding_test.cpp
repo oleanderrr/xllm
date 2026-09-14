@@ -158,6 +158,42 @@ class SamplingInputBindingTest
   std::shared_ptr<StreamEvent> ready_;
 };
 
+TEST_P(SamplingInputBindingTest, CpuMaskExportSurvivesCallerAndSlotReuse) {
+  const uint64_t pinned_bytes = binding_->pinned_bytes();
+  const uint64_t device_bytes = binding_->device_bytes();
+  auto input = make_input(/*rows=*/3, /*width=*/2);
+  auto expected = input.do_sample.clone();
+  ASSERT_TRUE(binding_->prepare(input, /*model_tokens=*/8, *prepare_).ok());
+  input.do_sample.zero_();
+  auto retained = binding_->copy_cpu_do_sample();
+  EXPECT_TRUE(torch::equal(retained, expected));
+  EXPECT_TRUE(retained.device().is_cpu());
+  EXPECT_FALSE(retained.is_pinned());
+  EXPECT_NE(retained.data_ptr(), input.do_sample.data_ptr());
+  auto independent = binding_->copy_cpu_do_sample();
+  independent.zero_();
+  EXPECT_TRUE(torch::equal(binding_->copy_cpu_do_sample(), expected));
+  ASSERT_EQ(prepare_->synchronize(), ACL_SUCCESS);
+
+  auto invalid = make_input(/*rows=*/1, /*width=*/1);
+  invalid.do_sample = torch::zeros({1}, torch::kInt32);
+  EXPECT_FALSE(binding_->prepare(invalid, /*model_tokens=*/8, *prepare_).ok());
+  EXPECT_TRUE(torch::equal(binding_->copy_cpu_do_sample(), expected));
+  SamplingParameters empty;
+  empty.do_sample = torch::empty({0}, torch::kBool);
+  ASSERT_TRUE(binding_->prepare(empty, /*model_tokens=*/0, *prepare_).ok());
+  auto empty_mask = binding_->copy_cpu_do_sample();
+  ASSERT_TRUE(empty_mask.defined());
+  EXPECT_EQ(empty_mask.numel(), 0);
+  EXPECT_FALSE(empty_mask.is_pinned());
+  ASSERT_TRUE(binding_->prepare({}, /*model_tokens=*/0, *prepare_).ok());
+  EXPECT_FALSE(binding_->copy_cpu_do_sample().defined());
+  EXPECT_EQ(binding_->pinned_bytes(), pinned_bytes);
+  EXPECT_EQ(binding_->device_bytes(), device_bytes);
+  binding_.reset();
+  EXPECT_TRUE(torch::equal(retained, expected));
+}
+
 TEST_P(SamplingInputBindingTest, FixedAddressesSurviveShapeAndFeatureChanges) {
   std::array<const void*, kInputs.size()> addresses{};
   for (int32_t round = 0; round < 16; ++round) {

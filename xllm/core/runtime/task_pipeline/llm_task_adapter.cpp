@@ -134,7 +134,8 @@ Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output) {
   // BatchInputBuilder leaves actual_num_sequences unset before Worker prepare.
   // ProfileManager also marks ordinary eager warmup as is_graph_warmup.
   // It is an output-metrics marker here, not permission for graph execution.
-  // Worker preserves it in the detached response; this invocation stays eager.
+  // The Slot preserves it in the detached response; this invocation stays
+  // eager.
   LlmTaskInput input;
   input.batch = {meta.batch_forward_type,
                  static_cast<uint32_t>(rows),
@@ -155,15 +156,19 @@ Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output) {
   // singleton DP summaries. They describe scheduler bookkeeping only: the
   // ordinary program reads token/position/KV views, not those algorithm fields.
   input.sampling = source.sampling_params;
+  input.is_warmup = meta.is_graph_warmup;
   input.sequence_state_keys = source.sequence_state_keys;
   input.retired_sequence_state_keys = source.retired_sequence_state_keys;
   output = std::move(input);
   return Status();
 }
 
-ForwardOutput make_llm_task_output(TokenResultTensors tokens) {
+ForwardOutput make_llm_task_output(LlmTaskOutput result) {
   ForwardOutput output;
   output.cpu_ready = true;
+  output.do_sample = std::move(result.do_sample);
+  output.is_graph_warmup = result.is_warmup;
+  const TokenResultTensors& tokens = result.tokens;
   if (!tokens.tokens.defined()) {
     return output;
   }

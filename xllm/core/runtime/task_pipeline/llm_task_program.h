@@ -51,6 +51,15 @@ struct LlmTaskInput {
   SamplingParameters sampling;
   std::span<const SequenceStateKey> sequence_state_keys;
   std::span<const SequenceStateKey> retired_sequence_state_keys;
+  // Output statistics only; this does not enable graph execution.
+  bool is_warmup = false;
+};
+
+// Every field is an independent CPU value when Consume returns.
+struct LlmTaskOutput {
+  TokenResultTensors tokens;
+  torch::Tensor do_sample;
+  bool is_warmup = false;
 };
 
 // One ordinary LLM program with private storage for each admitted Slot.
@@ -71,7 +80,7 @@ class LlmTaskProgram final {
 
   Status prepare(uint32_t slot_id, const LlmTaskInput& input);
   void launch(uint32_t slot_id);
-  TokenResultTensors consume(uint32_t slot_id);
+  LlmTaskOutput consume(uint32_t slot_id);
   void discard(uint32_t slot_id);
   uint32_t slot_count() const { return capacity_.slot_count; }
   uint64_t shared_device_bytes() const {
@@ -84,6 +93,7 @@ class LlmTaskProgram final {
 
  private:
   struct Slot {
+    bool is_warmup = false;
     StreamEventPtr input_ready;
     StreamEventPtr output_ready;
     std::unique_ptr<ModelInputStorage> storage;

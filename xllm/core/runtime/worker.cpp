@@ -240,22 +240,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
     CHECK(status.ok()) << status.message();
     const TaskSubmission submission = task_pipeline_->submit(input);
     CHECK(submission.status.ok()) << submission.status.message();
-    // Speculative consumers are gated off, but preserve the ordinary output
-    // metadata as a detached CPU value before releasing the transport views.
-    torch::Tensor do_sample = input.sampling.do_sample.defined()
-                                  ? input.sampling.do_sample.clone()
-                                  : torch::Tensor();
     return task_pipeline_->take_result_async(submission.task_id)
-        .thenValue(
-            [do_sample = std::move(do_sample),
-             is_warmup = source->input_params.meta.is_graph_warmup](
-                TaskResult result) mutable -> std::optional<ForwardOutput> {
-              CHECK(result.status.ok()) << result.status.message();
-              auto output = make_llm_task_output(std::move(result.tokens));
-              output.do_sample = std::move(do_sample);
-              output.is_graph_warmup = is_warmup;
-              return output;
-            })
+        .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
+          CHECK(result.status.ok()) << result.status.message();
+          return make_llm_task_output(std::move(result.output));
+        })
         .semi();
   }
 #endif

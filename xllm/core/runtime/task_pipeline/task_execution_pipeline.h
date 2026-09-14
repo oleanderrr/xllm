@@ -18,6 +18,7 @@ limitations under the License.
 #include <folly/futures/Future.h>
 
 #include <deque>
+#include <optional>
 
 #include "core/runtime/task_pipeline/llm_task_program.h"
 #include "core/util/concurrent_queue.h"
@@ -32,7 +33,8 @@ struct TaskSubmission {
 
 struct TaskResult {
   Status status;
-  TokenResultTensors tokens;
+  LlmTaskOutput output;
+  uint64_t task_id = 0;
 };
 
 // One or two eager Slots. The owner prevents external calls racing with
@@ -54,6 +56,9 @@ class TaskExecutionPipeline final {
   // without removing a completion. Slot retirement precedes
   // Future completion. An unrequested result continues to occupy the Slot.
   folly::Future<TaskResult> take_result_async(uint64_t task_id);
+  // The Step/GetLast adapter consumes the same FIFO without another ID queue.
+  // Empty FIFO returns INVALID_ARGUMENT. Successful results carry their ID.
+  folly::Future<TaskResult> take_result_async();
   uint64_t pinned_bytes() const { return program_->pinned_bytes(); }
   uint64_t device_bytes() const { return program_->device_bytes(); }
 
@@ -65,6 +70,8 @@ class TaskExecutionPipeline final {
 
   TaskExecutionPipeline(ThreadPool& state_executor,
                         std::unique_ptr<LlmTaskProgram> program);
+  folly::Future<TaskResult> take_result_impl(
+      std::optional<uint64_t> expected_task_id);
   void launch_loop();
   SlotTicket wait_completed_front();
   void check_external_thread() const;

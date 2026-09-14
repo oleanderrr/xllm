@@ -61,6 +61,10 @@ class SamplingInputBinding final {
                  uint32_t model_tokens,
                  const Stream& stream);
 
+  // Exports the last accepted CPU mask without a Device read. The result is
+  // independent and unpinned; call before this Slot is prepared again.
+  torch::Tensor copy_cpu_do_sample() const;
+
   const SamplingParameters& params() const { return params_; }
   const SamplingInputTransferInfo& transfer_info() const { return transfer_; }
   const SamplingInputCapacity& capacity() const { return capacity_; }
@@ -80,6 +84,7 @@ class SamplingInputBinding final {
   SamplingParameters host_storage_;
   SamplingParameters device_storage_;
   SamplingParameters params_;
+  torch::Tensor cpu_do_sample_;
   SamplingInputTransferInfo transfer_;
 };
 

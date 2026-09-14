@@ -404,18 +404,19 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
 
   void compare_result(const TaskResult& actual, const SampleOutput& expected) {
     ASSERT_TRUE(actual.status.ok()) << actual.status.message();
-    EXPECT_TRUE(torch::equal(actual.tokens.tokens.squeeze(/*dim=*/1),
+    EXPECT_TRUE(torch::equal(actual.output.tokens.tokens.squeeze(/*dim=*/1),
                              expected.next_tokens));
-    EXPECT_TRUE(torch::equal(actual.tokens.logprobs.squeeze(/*dim=*/1),
+    EXPECT_TRUE(torch::equal(actual.output.tokens.logprobs.squeeze(/*dim=*/1),
                              expected.logprobs));
-    EXPECT_TRUE(torch::equal(actual.tokens.top_tokens.squeeze(/*dim=*/1),
+    EXPECT_TRUE(torch::equal(actual.output.tokens.top_tokens.squeeze(/*dim=*/1),
                              expected.top_tokens));
-    EXPECT_TRUE(torch::equal(actual.tokens.top_logprobs.squeeze(/*dim=*/1),
-                             expected.top_logprobs));
-    EXPECT_TRUE(torch::equal(actual.tokens.lengths,
-                             torch::ones_like(actual.tokens.lengths)));
-    EXPECT_TRUE(actual.tokens.tokens.device().is_cpu());
-    EXPECT_FALSE(actual.tokens.tokens.is_pinned());
+    EXPECT_TRUE(
+        torch::equal(actual.output.tokens.top_logprobs.squeeze(/*dim=*/1),
+                     expected.top_logprobs));
+    EXPECT_TRUE(torch::equal(actual.output.tokens.lengths,
+                             torch::ones_like(actual.output.tokens.lengths)));
+    EXPECT_TRUE(actual.output.tokens.tokens.device().is_cpu());
+    EXPECT_FALSE(actual.output.tokens.tokens.is_pinned());
   }
 
   const torch::Device device_{torch::kPrivateUse1, 0};
@@ -501,8 +502,8 @@ TEST_P(Qwen3SlotForwardTest, PipelinePrefillDecodeSamplingAndInputOwnership) {
     EXPECT_EQ(
         pipeline->take_result_async(submitted.task_id).get().status.code(),
         StatusCode::INVALID_ARGUMENT);
-    snapshots.emplace_back(result.tokens.tokens.clone());
-    retained.emplace_back(std::move(result.tokens));
+    snapshots.emplace_back(result.output.tokens.tokens.clone());
+    retained.emplace_back(std::move(result.output.tokens));
   }
   pipeline.reset();
   for (uint32_t index = 0; index < retained.size(); ++index) {
@@ -532,7 +533,7 @@ TEST_P(Qwen3SlotForwardTest, TwoSlotsShareWorkspaceAndKeepPrivateInputs) {
               program->shared_device_bytes() + 2 * private_bytes);
     EXPECT_EQ(program->pinned_bytes(), 2 * pinned_bytes);
     EXPECT_EQ(program->slot_device_bytes(/*slot_id=*/1), private_bytes);
-    std::vector<TokenResultTensors> retained;
+    std::vector<LlmTaskOutput> retained;
     std::vector<SampleOutput> snapshots;
     retained.reserve(/*new_cap=*/12);
     snapshots.reserve(/*new_cap=*/12);
@@ -674,7 +675,7 @@ TEST_P(Qwen3SlotForwardTest, TwoSlotPipelineRetiresInOrderAndReusesStorage) {
     ASSERT_TRUE(last.status.ok());
     auto empty_result = pipeline->take_result_async(last.task_id).get();
     EXPECT_TRUE(empty_result.status.ok());
-    EXPECT_FALSE(empty_result.tokens.tokens.defined());
+    EXPECT_FALSE(empty_result.output.tokens.tokens.defined());
     pipeline.reset();
     compare_result(result_a, expected_first);
     compare_result(result_b, expected_second);
@@ -845,8 +846,8 @@ TEST_P(Qwen3SlotForwardTest,
     for (uint32_t step = 0; step < kTasks; ++step) {
       auto actual = pipeline->take_result_async(tickets[step]).get();
       compare_result(actual, expected[step]);
-      snapshots.emplace_back(actual.tokens.tokens.clone());
-      retained.emplace_back(std::move(actual.tokens));
+      snapshots.emplace_back(actual.output.tokens.tokens.clone());
+      retained.emplace_back(std::move(actual.output.tokens));
       if (step + 2 < kTasks) {
         submit(step + 2);
       }
@@ -859,7 +860,7 @@ TEST_P(Qwen3SlotForwardTest,
     ASSERT_TRUE(control.status.ok());
     auto control_result = pipeline->take_result_async(control.task_id).get();
     EXPECT_TRUE(control_result.status.ok());
-    EXPECT_FALSE(control_result.tokens.tokens.defined());
+    EXPECT_FALSE(control_result.output.tokens.tokens.defined());
     pipeline.reset();
     for (uint32_t index = 0; index < retained.size(); ++index) {
       EXPECT_TRUE(torch::equal(retained[index].tokens, snapshots[index]));
@@ -964,10 +965,139 @@ TEST_P(Qwen3SlotForwardTest,
     pipeline.reset();
     EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
     compare_kv();
-    EXPECT_TRUE(torch::equal(result_a.tokens.tokens.squeeze(/*dim=*/1),
+    EXPECT_TRUE(torch::equal(result_a.output.tokens.tokens.squeeze(/*dim=*/1),
                              expected_first.next_tokens));
-    EXPECT_TRUE(torch::equal(result_b.tokens.tokens.squeeze(/*dim=*/1),
+    EXPECT_TRUE(torch::equal(result_b.output.tokens.tokens.squeeze(/*dim=*/1),
                              expected_second.next_tokens));
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest,
+       OldestResultKeepsSlotMetadataAcrossMixedTakeCalls) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    const auto reference = [&](const BatchData& batch,
+                               BatchForwardType phase,
+                               const SamplingParameters& params) {
+      return this->reference(batch, phase, params, parameter_dtype);
+    };
+
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    auto missing = pipeline->take_result_async().get();
+    EXPECT_EQ(missing.status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(missing.task_id, 0U);
+    auto first = make_batch(/*q=*/{2, 1}, /*kv=*/{2, 1});
+    auto second = make_batch(/*q=*/{1}, /*kv=*/{3});
+    auto third = make_batch(/*q=*/{1}, /*kv=*/{4});
+    auto first_params = sampling_for(first, /*mode=*/2);
+    auto second_params = sampling_for(second, /*mode=*/0);
+    auto third_params = sampling_for(third, /*mode=*/1);
+    const auto first_mask = first_params.do_sample.clone();
+    const auto second_mask = second_params.do_sample.clone();
+    const auto third_mask = third_params.do_sample.clone();
+    const auto rng_before = pipeline_rng_state();
+    auto expected_first =
+        reference(first, BatchForwardType::PREFILL, first_params);
+    auto expected_second =
+        reference(second, BatchForwardType::DECODE, second_params);
+    auto expected_third =
+        reference(third, BatchForwardType::DECODE, third_params);
+    const auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+
+    LlmTaskInput input_a{view(first),
+                         {BatchForwardType::PREFILL, 2},
+                         first_params,
+                         {},
+                         {},
+                         true};
+    LlmTaskInput input_b{
+        view(second), {BatchForwardType::DECODE, 1}, second_params};
+    const auto a = pipeline->submit(input_a);
+    const auto b = pipeline->submit(input_b);
+    ASSERT_TRUE(a.status.ok());
+    ASSERT_TRUE(b.status.ok());
+    input_a.is_warmup = false;
+    input_b.is_warmup = true;
+    first_params.do_sample.zero_();
+    second_params.do_sample.fill_(/*value=*/true);
+    const auto wrong = pipeline->take_result_async(b.task_id).get();
+    EXPECT_EQ(wrong.status.code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(wrong.task_id, 0U);
+    const auto zero = pipeline->take_result_async(/*task_id=*/0).get();
+    EXPECT_EQ(zero.status.code(), StatusCode::INVALID_ARGUMENT);
+    auto result_a = pipeline->take_result_async().get();
+    ASSERT_EQ(result_a.task_id, a.task_id);
+    compare_result(result_a, expected_first);
+    EXPECT_TRUE(torch::equal(result_a.output.do_sample, first_mask));
+    EXPECT_TRUE(result_a.output.is_warmup);
+    EXPECT_FALSE(result_a.output.do_sample.is_pinned());
+
+    const auto c = pipeline->submit(
+        {view(third), {BatchForwardType::DECODE, 1}, third_params});
+    ASSERT_TRUE(c.status.ok());
+    auto result_b = pipeline->take_result_async(b.task_id).get();
+    ASSERT_EQ(result_b.task_id, b.task_id);
+    compare_result(result_b, expected_second);
+    EXPECT_TRUE(torch::equal(result_b.output.do_sample, second_mask));
+    EXPECT_FALSE(result_b.output.is_warmup);
+    auto result_c = pipeline->take_result_async().get();
+    ASSERT_EQ(result_c.task_id, c.task_id);
+    compare_result(result_c, expected_third);
+    EXPECT_TRUE(torch::equal(result_c.output.do_sample, third_mask));
+    EXPECT_FALSE(result_c.output.is_warmup);
+    EXPECT_EQ(pipeline->take_result_async(a.task_id).get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    pipeline.reset();
+    EXPECT_TRUE(torch::equal(result_a.output.do_sample, first_mask));
+    EXPECT_TRUE(torch::equal(result_b.output.do_sample, second_mask));
+    compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest,
+       EmptyTasksRetainDistinctOutputMetadataWithoutSampling) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    BatchData empty;
+    SamplingParameters params;
+    params.do_sample = torch::empty({0}, torch::kBool);
+    const auto rng_before = pipeline_rng_state();
+    const auto first = pipeline->submit(
+        {view(empty), {BatchForwardType::EMPTY, 0}, params, {}, {}, true});
+    const auto second =
+        pipeline->submit({view(empty), {BatchForwardType::EMPTY, 0}, {}});
+    ASSERT_TRUE(first.status.ok());
+    ASSERT_TRUE(second.status.ok());
+    const auto full =
+        pipeline->submit({view(empty), {BatchForwardType::EMPTY, 0}, {}});
+    EXPECT_EQ(full.status.code(), StatusCode::RESOURCE_EXHAUSTED);
+    auto result_a = pipeline->take_result_async().get();
+    auto result_b = pipeline->take_result_async().get();
+    ASSERT_TRUE(result_a.status.ok());
+    ASSERT_TRUE(result_b.status.ok());
+    EXPECT_EQ(result_a.task_id, first.task_id);
+    EXPECT_EQ(result_b.task_id, second.task_id);
+    EXPECT_FALSE(result_a.output.tokens.tokens.defined());
+    ASSERT_TRUE(result_a.output.do_sample.defined());
+    EXPECT_EQ(result_a.output.do_sample.numel(), 0);
+    EXPECT_FALSE(result_a.output.do_sample.is_pinned());
+    EXPECT_TRUE(result_a.output.is_warmup);
+    EXPECT_FALSE(result_b.output.tokens.tokens.defined());
+    EXPECT_FALSE(result_b.output.do_sample.defined());
+    EXPECT_FALSE(result_b.output.is_warmup);
+    EXPECT_EQ(pipeline->take_result_async().get().status.code(),
+              StatusCode::INVALID_ARGUMENT);
+    EXPECT_TRUE(torch::equal(rng_before, pipeline_rng_state()));
   }
 }
 
@@ -1053,7 +1183,7 @@ TEST_P(Qwen3SlotForwardTest, PipelineEmptyAndChunkedPrefillWithoutSampling) {
   ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
   auto result = pipeline->take_result_async(submitted.task_id).get();
   ASSERT_TRUE(result.status.ok());
-  EXPECT_FALSE(result.tokens.tokens.defined());
+  EXPECT_FALSE(result.output.tokens.tokens.defined());
   auto batch = make_batch({3, 2}, {3, 2});
   reference(batch, BatchForwardType::PREFILL, {});
   submitted =
@@ -1061,7 +1191,7 @@ TEST_P(Qwen3SlotForwardTest, PipelineEmptyAndChunkedPrefillWithoutSampling) {
   ASSERT_TRUE(submitted.status.ok());
   result = pipeline->take_result_async(submitted.task_id).get();
   EXPECT_TRUE(result.status.ok());
-  EXPECT_FALSE(result.tokens.tokens.defined());
+  EXPECT_FALSE(result.output.tokens.tokens.defined());
   if (GetParam()) {
     batch = make_batch({2, 1}, {5, 3});
     auto params = sampling_for(batch, /*mode=*/0);
@@ -1178,7 +1308,7 @@ TEST_P(Qwen3SlotForwardTest, PipelineFixedFourRowServingSchedule) {
     compare_result(result, expected);
     for (int32_t row = 0; row < rows; ++row) {
       previous[row] = static_cast<int32_t>(
-          result.tokens.tokens.const_data_ptr<int64_t>()[row]);
+          result.output.tokens.tokens.const_data_ptr<int64_t>()[row]);
     }
   }
   pipeline.reset();

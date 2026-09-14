@@ -58,6 +58,7 @@ TEST(LlmTaskAdapterTest, BorrowsOrdinaryBuilderViewsUntilPrepareAck) {
   EXPECT_EQ(task.batch.num_actual_sequences, 1);
   EXPECT_EQ(task.batch.batch_id, 42);
   EXPECT_FALSE(task.batch.is_graph_warmup);
+  EXPECT_TRUE(task.is_warmup);
   EXPECT_EQ(task.model.token_ids.data(),
             source.token_ids.const_data_ptr<int32_t>());
   EXPECT_EQ(task.model.new_cache_slots.data(),
@@ -158,7 +159,12 @@ TEST(LlmTaskAdapterTest, PublishesCpuViewsWithNoCopyAndKeepsOwnership) {
   tokens.top_logprobs =
       torch::tensor({{{-0.2f, -0.5f}}, {{-0.3f, -0.6f}}}, torch::kFloat32);
   const void* original = tokens.tokens.data_ptr();
-  auto output = make_llm_task_output(std::move(tokens));
+  auto mask = torch::tensor({false, true}, torch::kBool);
+  const void* mask_address = mask.data_ptr();
+  auto output =
+      make_llm_task_output({std::move(tokens), std::move(mask), true});
+  EXPECT_EQ(output.do_sample.data_ptr(), mask_address);
+  EXPECT_TRUE(output.is_graph_warmup);
   EXPECT_TRUE(output.cpu_ready);
   EXPECT_EQ(output.ready_event, nullptr);
   EXPECT_EQ(output.sample_output.next_tokens.data_ptr(), original);
@@ -168,7 +174,9 @@ TEST(LlmTaskAdapterTest, PublishesCpuViewsWithNoCopyAndKeepsOwnership) {
   EXPECT_TRUE(output.logprobs);
   EXPECT_EQ(output.max_top_logprobs, 2);
   EXPECT_EQ(output.sample_output.next_tokens[1].item<int64_t>(), 12);
-  auto empty = make_llm_task_output({});
+  auto empty = make_llm_task_output({{}, {}, true});
+  EXPECT_TRUE(empty.is_graph_warmup);
+  EXPECT_FALSE(empty.do_sample.defined());
   EXPECT_TRUE(empty.cpu_ready);
   EXPECT_FALSE(empty.sample_output.next_tokens.defined());
 }
