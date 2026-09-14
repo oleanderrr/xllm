@@ -107,6 +107,11 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       batch_mode_(resolve_batch_mode(options)),
       engine_(engine),
       request_queue_(::xllm::RecConfig::get_instance().request_queue_size()) {
+  CHECK_GE(options_.task_pipeline_max_live_sequences(), 0);
+  if (options_.task_pipeline_max_live_sequences() > 0) {
+    sequence_state_budget_ = std::make_shared<SequenceStateBudget>(
+        static_cast<uint32_t>(options_.task_pipeline_max_live_sequences()));
+  }
   CHECK(engine_ != nullptr);
   prefetch_admission_limit_ = static_cast<size_t>(
       ::xllm::RecConfig::get_instance().request_queue_size());
@@ -188,6 +193,12 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
 
+  SequenceStateReservation reservation;
+  if (sequence_state_budget_ != nullptr &&
+      !reservation.acquire(sequence_state_budget_, request->best_of())) {
+    return false;
+  }
+
   {
     std::lock_guard<std::mutex> lock(prefetch_admission_mutex_);
     if (request_queue_.size() + prefetch_admission_slots_ >=
@@ -195,6 +206,12 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
       return false;
     }
     ++prefetch_admission_slots_;
+  }
+
+  // The local reservation rolls back if the ingress check above rejects.
+  // Once admitted, Request retains it across all queues and response owners.
+  if (!reservation.empty()) {
+    request->set_sequence_state_reservation(std::move(reservation));
   }
 
   kv_cache_manager_->prefetch_from_storage(request);

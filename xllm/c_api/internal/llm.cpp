@@ -114,6 +114,9 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
 
     options.task_pipeline_slots(
         ::xllm::ExecutionConfig::get_instance().task_pipeline_slots());
+    options.task_pipeline_max_live_sequences(
+        ::xllm::ExecutionConfig::get_instance()
+            .task_pipeline_max_live_sequences());
     options.enable_graph(
         ::xllm::ExecutionConfig::get_instance().enable_graph());
 

@@ -42,6 +42,7 @@ class ExecutionConfig final {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
         {"task_pipeline_slots",
+         "task_pipeline_max_live_sequences",
          "enable_graph",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
@@ -62,6 +63,8 @@ class ExecutionConfig final {
 
   // 0 uses the existing executor; 1 enables the single-Slot task pipeline.
   PROPERTY(int32_t, task_pipeline_slots) = 0;
+  // Request-wide Sequence reservations, active only with the task pipeline.
+  PROPERTY(int32_t, task_pipeline_max_live_sequences) = 1024;
 
   PROPERTY(bool, enable_graph) = false;
 

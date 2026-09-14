@@ -82,6 +82,13 @@ void Request::create_sequences_group() {
                                        std::move(sequence_params));
 }
 
+void Request::set_sequence_state_reservation(
+    SequenceStateReservation reservation) {
+  CHECK(sequence_state_reservation_.empty());
+  CHECK(!reservation.empty());
+  sequence_state_reservation_ = std::move(reservation);
+}
+
 bool Request::finished() const {
   return error_status().has_value() || sequences_group_->finished();
 }

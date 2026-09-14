@@ -10,6 +10,7 @@
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/request/sequence_state_retirement_queue.h"
 #include "distributed_runtime/engine.h"
 #include "scheduler_factory.h"
 #include "util/utils.h"
@@ -131,6 +132,17 @@ class TestContinuousScheduler final : public ContinuousScheduler {
   }
 
   size_t scheduler_queue_size() { return request_queue_.size(); }
+
+  void clear_ready_requests() {
+    std::shared_ptr<Request> request;
+    while (request_queue_.read(request)) {
+      request.reset();
+    }
+  }
+
+  std::weak_ptr<SequenceStateBudget> state_budget_observer() const {
+    return sequence_state_budget_;
+  }
 
   void wait_for_responses() { response_processor_->wait_completion(); }
 };
@@ -344,6 +356,48 @@ void set_chunk_kv(const std::shared_ptr<Request>& request, size_t kv_tokens) {
     seq->kv_state().set_kv_cache_tokens_num(kv_tokens);
   }
 }
+
+std::shared_ptr<Request> make_state_budget_request(uint32_t best_of) {
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(/*tokens=*/4);
+  stopping.set_max_context_len(/*len=*/64);
+  RequestState state(/*prompt=*/"budget",
+                     std::vector<int32_t>{7, 8, 9},
+                     RequestSamplingParam(),
+                     SchedulerParam(),
+                     std::move(stopping),
+                     /*seq_capacity=*/64,
+                     /*n=*/1,
+                     best_of,
+                     /*logprobs=*/false,
+                     /*stream=*/false,
+                     /*echo=*/false,
+                     /*skip_special_tokens=*/true,
+                     /*enable_schedule_overlap=*/false,
+                     /*output_func=*/nullptr,
+                     /*outputs_func=*/nullptr);
+  return std::make_shared<Request>(/*request_id=*/"budget",
+                                   /*x_request_id=*/"",
+                                   /*x_request_time=*/"",
+                                   std::move(state));
+}
+
+class QuotaObservedSequence final : public Sequence {
+ public:
+  QuotaObservedSequence(const Sequence& source,
+                        std::shared_ptr<SequenceStateBudget> budget,
+                        bool& quota_pinned)
+      : Sequence(source),
+        budget_(std::move(budget)),
+        quota_pinned_(quota_pinned) {}
+  ~QuotaObservedSequence() override {
+    quota_pinned_ = budget_->available() == 0;
+  }
+
+ private:
+  std::shared_ptr<SequenceStateBudget> budget_;
+  bool& quota_pinned_;  // Test flag outlives this Sequence.
+};
 
 }  // namespace
 
@@ -1275,6 +1329,136 @@ TEST(ContinuousSchedulerTest,
   // engine to skip the block manager's "all blocks freed" teardown check.
   scheduler.reset();
   (void)engine.release();
+}
+
+TEST(ContinuousSchedulerTest, SequenceStateBudgetCountsBestOfBeforePrefetch) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(/*max_tokens_per_batch=*/64,
+                               /*max_seqs_per_batch=*/4,
+                               /*num_speculative_tokens=*/0,
+                               /*max_tokens_per_chunk_for_prefill=*/64,
+                               /*dp_size=*/1);
+  options.task_pipeline_max_live_sequences(/*value=*/3);
+  auto engine =
+      std::make_unique<FakeEngine>(/*num_blocks=*/64, /*block_size=*/32);
+  auto scheduler =
+      std::make_unique<TestContinuousScheduler>(engine.get(), options);
+  auto oversized = make_state_budget_request(/*best_of=*/4);
+  EXPECT_FALSE(scheduler->add_request(oversized));
+  EXPECT_EQ(engine->prefetch_calls(), 0U);
+  auto first = make_state_budget_request(/*best_of=*/2);
+  auto second = make_state_budget_request(/*best_of=*/2);
+  auto single = make_state_budget_request(/*best_of=*/1);
+  ASSERT_EQ(first->sequences().size(), 1U);
+  ASSERT_TRUE(scheduler->add_request(first));
+  EXPECT_FALSE(scheduler->add_request(second));
+  EXPECT_EQ(engine->prefetch_calls(), 1U);
+  ASSERT_TRUE(scheduler->add_request(single));
+  EXPECT_EQ(engine->prefetch_calls(), 2U);
+  EXPECT_EQ(scheduler->scheduler_queue_size(), 2U);
+}
+
+TEST(ContinuousSchedulerTest, SequenceStateBudgetRollsBackWhenIngressIsFull) {
+  ScopedConfigValue<int32_t> queue_size(
+      RecConfig::get_instance().request_queue_size(), /*new_value=*/1);
+  ContinuousScheduler::Options options =
+      create_scheduler_options(/*max_tokens_per_batch=*/64,
+                               /*max_seqs_per_batch=*/4,
+                               /*num_speculative_tokens=*/0,
+                               /*max_tokens_per_chunk_for_prefill=*/64,
+                               /*dp_size=*/1);
+  options.task_pipeline_max_live_sequences(/*value=*/2);
+  auto engine =
+      std::make_unique<FakeEngine>(/*num_blocks=*/64, /*block_size=*/32);
+  auto scheduler =
+      std::make_unique<TestContinuousScheduler>(engine.get(), options);
+  auto first = make_state_budget_request(/*best_of=*/1);
+  auto second = make_state_budget_request(/*best_of=*/1);
+  ASSERT_TRUE(scheduler->add_request(first));
+  EXPECT_FALSE(scheduler->add_request(second));
+  EXPECT_EQ(engine->prefetch_calls(), 1U);
+  scheduler->clear_ready_requests();
+  // The caller still holds first's quota. The rejected second request must
+  // nevertheless be retryable with the rolled-back remaining reservation.
+  ASSERT_TRUE(scheduler->add_request(second));
+  EXPECT_EQ(engine->prefetch_calls(), 2U);
+}
+
+TEST(ContinuousSchedulerTest, SequenceStateBudgetKeepsCancelledRequestQuota) {
+  ContinuousScheduler::Options options =
+      create_scheduler_options(/*max_tokens_per_batch=*/64,
+                               /*max_seqs_per_batch=*/4,
+                               /*num_speculative_tokens=*/0,
+                               /*max_tokens_per_chunk_for_prefill=*/64,
+                               /*dp_size=*/1);
+  options.task_pipeline_max_live_sequences(/*value=*/1);
+  auto engine =
+      std::make_unique<FakeEngine>(/*num_blocks=*/64, /*block_size=*/32);
+  engine->set_prefetch_ready(/*ready=*/false);
+  auto scheduler =
+      std::make_unique<TestContinuousScheduler>(engine.get(), options);
+  auto first = make_state_budget_request(/*best_of=*/1);
+  auto second = make_state_budget_request(/*best_of=*/1);
+  ASSERT_TRUE(scheduler->add_request(first));
+  EXPECT_FALSE(scheduler->add_request(second));
+  EXPECT_EQ(engine->prefetch_calls(), 1U);
+  first->set_cancel();
+  engine->set_prefetch_ready(/*ready=*/true);
+  const auto batches = scheduler->prepare_batch_test();
+  ASSERT_EQ(batches.size(), 1U);
+  EXPECT_TRUE(batches.front().empty());
+  scheduler->wait_for_responses();
+  EXPECT_EQ(scheduler->num_prefetch_pending_requests(), 0U);
+  EXPECT_FALSE(scheduler->add_request(second));
+  first.reset();
+  ASSERT_TRUE(scheduler->add_request(second));
+  EXPECT_EQ(engine->prefetch_calls(), 2U);
+}
+
+TEST(ContinuousSchedulerTest, SequenceStateBudgetOutlivesScheduler) {
+  auto engine =
+      std::make_unique<FakeEngine>(/*num_blocks=*/64, /*block_size=*/32);
+  auto request = make_state_budget_request(/*best_of=*/1);
+  std::weak_ptr<SequenceStateBudget> observer;
+  {
+    ContinuousScheduler::Options options =
+        create_scheduler_options(/*max_tokens_per_batch=*/64,
+                                 /*max_seqs_per_batch=*/4,
+                                 /*num_speculative_tokens=*/0,
+                                 /*max_tokens_per_chunk_for_prefill=*/64,
+                                 /*dp_size=*/1);
+    options.task_pipeline_max_live_sequences(/*value=*/1);
+    auto scheduler =
+        std::make_unique<TestContinuousScheduler>(engine.get(), options);
+    observer = scheduler->state_budget_observer();
+    ASSERT_TRUE(scheduler->add_request(request));
+  }
+  EXPECT_FALSE(observer.expired());
+  request.reset();
+  EXPECT_TRUE(observer.expired());
+}
+
+TEST(ContinuousSchedulerTest,
+     SequenceStateBudgetReturnsAfterSequenceRetirement) {
+  auto budget = std::make_shared<SequenceStateBudget>(/*capacity=*/1);
+  auto queue = std::make_shared<SequenceStateRetirementQueue>();
+  bool quota_pinned_during_destruction = false;
+  auto request = make_state_budget_request(/*best_of=*/1);
+  auto sequence = std::make_unique<QuotaObservedSequence>(
+      *request->sequences().front(), budget, quota_pinned_during_destruction);
+  sequence->track_sequence_state(queue);
+  const auto key = sequence->sequence_state_key();
+  request->sequences().front() = std::move(sequence);
+  SequenceStateReservation reservation;
+  ASSERT_TRUE(reservation.acquire(budget, /*count=*/1));
+  request->set_sequence_state_reservation(std::move(reservation));
+  request.reset();
+  EXPECT_TRUE(quota_pinned_during_destruction);
+  EXPECT_EQ(budget->available(), 1U);
+  const auto retired = queue->drain();
+  ASSERT_EQ(retired.size(), 1U);
+  EXPECT_EQ(retired.front().sequence_id, key.sequence_id);
+  EXPECT_EQ(retired.front().epoch, key.epoch);
 }
 
 }  // namespace xllm

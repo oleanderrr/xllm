@@ -96,6 +96,10 @@ class ContinuousScheduler : public Scheduler {
     // the maximum number of sequences per batch
     PROPERTY(int32_t, max_seqs_per_batch) = 256;
 
+    // 0 preserves Legacy admission. Positive values reserve all potential
+    // Sequences for each request, including queue and response lifetimes.
+    PROPERTY(int32_t, task_pipeline_max_live_sequences) = 0;
+
     // the max tokens per chunk for request in prefill stage.
     PROPERTY(int32_t, max_tokens_per_chunk_for_prefill);
 
@@ -322,6 +326,7 @@ class ContinuousScheduler : public Scheduler {
   // ::xllm::RecConfig::get_instance().request_queue_size() the schedule
   // owns the requests and manages their lifetimes.
   folly::MPMCQueue<std::shared_ptr<Request>> request_queue_;
+  std::shared_ptr<SequenceStateBudget> sequence_state_budget_;
 
   // Requests waiting for Mooncake prefetch completion. This is an admission
   // barrier only; SchedulerPolicy never sees these requests.

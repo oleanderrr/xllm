@@ -234,6 +234,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .disable_ttft_profiling(profile_config.disable_ttft_profiling())
       .enable_forward_interruption(profile_config.enable_forward_interruption())
       .task_pipeline_slots(execution_config.task_pipeline_slots())
+      .task_pipeline_max_live_sequences(
+          execution_config.task_pipeline_max_live_sequences())
       .enable_graph(execution_config.enable_graph())
       .enable_graph_mode_decode_no_padding(
           execution_config.enable_graph_mode_decode_no_padding())

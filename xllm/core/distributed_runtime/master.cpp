@@ -432,6 +432,8 @@ Master::Master(const Options& options, EngineType type)
   CHECK_GE(options_.task_pipeline_slots(), 0);
   CHECK_LE(options_.task_pipeline_slots(), 1);
   if (options_.task_pipeline_slots() != 0) {
+    CHECK_GT(options_.task_pipeline_max_live_sequences(), 0)
+        << "Task pipeline requires a positive live Sequence budget.";
     CHECK(type == EngineType::LLM && options_.task_type() == "generate" &&
           !options_.enable_offline_inference())
         << "Task pipeline currently requires online ordinary LLM generation.";

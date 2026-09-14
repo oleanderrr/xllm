@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "common.pb.h"
+#include "core/framework/request/sequence_state_budget.h"
 #include "request_base.h"
 #include "request_state.h"
 #include "sequences_group.h"
@@ -46,6 +47,9 @@ class Request : public RequestBase {
           RateLimiter* rate_limiter = nullptr);
 
   bool finished() const;
+
+  // Set once after successful ingress admission, before any KV prefetch.
+  void set_sequence_state_reservation(SequenceStateReservation reservation);
 
   std::vector<std::unique_ptr<Sequence>>& sequences() {
     return sequences_group_->sequences();
@@ -173,6 +177,9 @@ class Request : public RequestBase {
 
  private:
   RequestState state_;
+  // Declared before sequences_group_: destroy all Sequences (and emit their
+  // retirements) before this reservation returns quota to another request.
+  SequenceStateReservation sequence_state_reservation_;
   std::shared_ptr<RequestFailureState> failure_state_ =
       std::make_shared<RequestFailureState>();
   std::shared_ptr<SpeculativeTokenStats> speculative_token_stats_ =

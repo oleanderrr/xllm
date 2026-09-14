@@ -24,6 +24,12 @@ DEFINE_int32(
     "Task execution pipeline Slots: 0 disables it, 1 enables the "
     "single-rank NPU Python eager pipeline without scheduler overlap.");
 
+DEFINE_int32(task_pipeline_max_live_sequences,
+             1024,
+             "Maximum reserved live Sequences across task pipeline requests. "
+             "Each request reserves best_of for its lifetime. Must be positive "
+             "when the pipeline is enabled; ignored when it is disabled.");
+
 DEFINE_bool(
     enable_graph,
     false,
@@ -111,6 +117,7 @@ namespace xllm {
 
 void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(task_pipeline_slots);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(task_pipeline_max_live_sequences);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
@@ -130,6 +137,7 @@ void ExecutionConfig::from_flags() {
 
 void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(task_pipeline_slots);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(task_pipeline_max_live_sequences);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
@@ -152,6 +160,8 @@ void ExecutionConfig::append_config_json(
   const ExecutionConfig default_config;
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, task_pipeline_slots);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, task_pipeline_max_live_sequences);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

@@ -16,6 +16,13 @@ cc_library(
 )
 
 cc_library(
+  NAME sequence_state_budget
+  HDRS sequence_state_budget.h
+  SRCS sequence_state_budget.cpp
+  DEPS glog::glog
+)
+
+cc_library(
   NAME 
     request
   HDRS
@@ -73,6 +80,7 @@ cc_library(
     priority_comparator.cpp
   DEPS
     :sequence_state_key
+    :sequence_state_budget
     :sequence_state_retirement_queue
     :config
     :kv_cache
