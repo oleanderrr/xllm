@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -34,6 +35,15 @@ struct SequenceStateHandle {
   uint64_t generation = 0;
 };
 
+// Positions describe accepted execution, not a CPU copy of the token value.
+// A read requires an earlier accepted publication at exactly that position.
+// Positions fit int32 model indices; each publication advances the position.
+struct SequenceStateAccess {
+  SequenceStateKey key;
+  std::optional<uint32_t> read_position;
+  std::optional<uint32_t> publish_position;
+};
+
 class SequenceStatePool;
 
 // One Task's row references. The pool outlives the lease.
@@ -41,7 +51,8 @@ class SequenceStatePool;
 // Device reader or writer.
 class SequenceStateLease final {
  public:
-  SequenceStateLease() = default;
+  // Capacity is allocated once; reset releases references but retains storage.
+  explicit SequenceStateLease(uint32_t capacity = 0);
   ~SequenceStateLease();
   SequenceStateLease(SequenceStateLease&& other) noexcept;
   SequenceStateLease& operator=(SequenceStateLease&& other) noexcept;
@@ -54,8 +65,6 @@ class SequenceStateLease final {
 
  private:
   friend class SequenceStatePool;
-  SequenceStateLease(SequenceStatePool& pool,
-                     std::vector<SequenceStateHandle> handles);
 
   SequenceStatePool* pool_ = nullptr;  // Non-owning; see lifetime contract.
   std::vector<SequenceStateHandle> handles_;
@@ -74,15 +83,18 @@ class SequenceStatePool final {
   SequenceStatePool(const SequenceStatePool&) = delete;
   SequenceStatePool& operator=(const SequenceStatePool&) = delete;
 
-  // Keys are unique within a Task; sequence_id=0 is invalid. New keys allocate
-  // rows, existing live keys retain them. Expected failures preserve the pool
-  // and output. A nonempty output lease must first be retired by its owner.
-  Status acquire(std::span<const SequenceStateKey> keys,
-                 SequenceStateLease& output);
-  // Logical end: reject new references but keep all existing leases valid.
-  // Keys must still be registered. Repeating a retired key with pending leases
-  // is harmless; after reclamation it is unknown and must not be sent again.
-  Status retire(std::span<const SequenceStateKey> keys);
+  // Atomically retire old keys and acquire this Task's accesses in row order.
+  // All expected rejection preserves mapping, generations, references,
+  // publication positions and output. Access/retirement keys must be unique
+  // and disjoint. Retired rows with outstanding leases cannot be reused.
+  // Unknown retirements are invalid; repeats are accepted only while the
+  // retired row still exists because a previous Task retains its lease.
+  // The caller preallocates the output lease's capacity at Slot creation.
+  // An accepted publication must run before any later Task's Device read;
+  // cancellation discards its result, never its queued execution.
+  Status admit(std::span<const SequenceStateAccess> accesses,
+               std::span<const SequenceStateKey> retired_keys,
+               SequenceStateLease& output);
 
   uint32_t capacity() const { return static_cast<uint32_t>(entries_.size()); }
   uint32_t available_rows() const {
@@ -102,10 +114,11 @@ class SequenceStatePool final {
     uint64_t generation = 1;
     uint32_t references = 0;
     bool retired = false;
+    std::optional<uint32_t> published_position;
   };
 
   SequenceStatePool(uint32_t capacity, const torch::Device& device);
-  Status validate_keys(std::span<const SequenceStateKey> keys);
+  Status validate_keys(std::vector<SequenceStateKey>& keys);
   void release(std::span<const SequenceStateHandle> handles);
   void reclaim(uint32_t row);
 
@@ -114,6 +127,7 @@ class SequenceStatePool final {
   std::vector<uint32_t> free_rows_;
   // Scratch is reserved once; validation does not modify logical pool state.
   std::vector<SequenceStateKey> key_scratch_;
+  std::vector<SequenceStateKey> retirement_scratch_;
   absl::flat_hash_map<std::pair<uint64_t, uint64_t>, uint32_t> rows_by_key_;
 };
 

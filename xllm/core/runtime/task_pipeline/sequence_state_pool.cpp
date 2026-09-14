@@ -34,14 +34,14 @@ Status invalid(const char* message) {
 
 }  // namespace
 
-SequenceStateLease::SequenceStateLease(SequenceStatePool& pool,
-                                       std::vector<SequenceStateHandle> handles)
-    : pool_(&pool), handles_(std::move(handles)) {}
+SequenceStateLease::SequenceStateLease(uint32_t capacity) {
+  handles_.reserve(capacity);
+}
 
 SequenceStateLease::~SequenceStateLease() { reset(); }
 
 SequenceStateLease::SequenceStateLease(SequenceStateLease&& other) noexcept
-    : pool_(std::exchange(other.pool_, nullptr)),
+    : pool_(std::exchange(other.pool_, /*new_value=*/nullptr)),
       handles_(std::move(other.handles_)) {
   other.handles_.clear();
 }
@@ -50,7 +50,7 @@ SequenceStateLease& SequenceStateLease::operator=(
     SequenceStateLease&& other) noexcept {
   if (this != &other) {
     reset();
-    pool_ = std::exchange(other.pool_, nullptr);
+    pool_ = std::exchange(other.pool_, /*new_value=*/nullptr);
     handles_ = std::move(other.handles_);
     other.handles_.clear();
   }
@@ -85,6 +85,7 @@ SequenceStatePool::SequenceStatePool(uint32_t capacity,
       {capacity}, torch::TensorOptions().dtype(torch::kInt64).device(device));
   free_rows_.reserve(capacity);
   key_scratch_.reserve(capacity);
+  retirement_scratch_.reserve(capacity);
   rows_by_key_.reserve(capacity);
   for (uint32_t row = capacity; row > 0; --row) {
     free_rows_.emplace_back(row - 1);
@@ -97,47 +98,81 @@ SequenceStatePool::~SequenceStatePool() {
   }
 }
 
-Status SequenceStatePool::validate_keys(
-    std::span<const SequenceStateKey> keys) {
-  if (keys.size() > capacity()) {
-    return Status(StatusCode::RESOURCE_EXHAUSTED,
-                  "Sequence-state batch exceeds the fixed pool capacity.");
-  }
-  key_scratch_.assign(keys.begin(), keys.end());
-  std::sort(key_scratch_.begin(),
-            key_scratch_.end(),
+Status SequenceStatePool::validate_keys(std::vector<SequenceStateKey>& keys) {
+  std::sort(keys.begin(),
+            keys.end(),
             [](const SequenceStateKey& left, const SequenceStateKey& right) {
               return map_key(left) < map_key(right);
             });
-  if (!key_scratch_.empty() && key_scratch_.front().sequence_id == 0) {
+  if (!keys.empty() && keys.front().sequence_id == 0) {
     return invalid("Sequence-state identity must be nonzero.");
   }
   const auto duplicate = std::adjacent_find(
-      key_scratch_.begin(),
-      key_scratch_.end(),
+      keys.begin(),
+      keys.end(),
       [](const SequenceStateKey& left, const SequenceStateKey& right) {
         return map_key(left) == map_key(right);
       });
-  if (duplicate != key_scratch_.end()) {
+  if (duplicate != keys.end()) {
     return invalid("Duplicate sequence-state identity in one batch.");
   }
   return Status();
 }
 
-Status SequenceStatePool::acquire(std::span<const SequenceStateKey> keys,
-                                  SequenceStateLease& output) {
-  if (!output.empty()) {
+Status SequenceStatePool::admit(std::span<const SequenceStateAccess> accesses,
+                                std::span<const SequenceStateKey> retired_keys,
+                                SequenceStateLease& output) {
+  if (!output.empty() || accesses.size() > output.handles_.capacity()) {
     return Status(StatusCode::RESOURCE_EXHAUSTED,
-                  "Retire the existing sequence-state lease before reuse.");
+                  "Sequence-state lease is occupied or lacks fixed capacity.");
   }
-  Status status = validate_keys(keys);
+  if (accesses.size() > capacity() || retired_keys.size() > capacity()) {
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Sequence-state input exceeds the fixed pool capacity.");
+  }
+  key_scratch_.clear();
+  for (const SequenceStateAccess& access : accesses) {
+    key_scratch_.emplace_back(access.key);
+  }
+  Status status = validate_keys(key_scratch_);
   if (!status.ok()) {
     return status;
   }
-  uint32_t new_rows = 0;
-  for (const SequenceStateKey& key : keys) {
+  retirement_scratch_.assign(retired_keys.begin(), retired_keys.end());
+  status = validate_keys(retirement_scratch_);
+  if (!status.ok()) {
+    return status;
+  }
+  uint32_t reclaimable = 0;
+  for (const SequenceStateKey& key : retired_keys) {
     const auto it = rows_by_key_.find(map_key(key));
     if (it == rows_by_key_.end()) {
+      return invalid("Cannot retire an unknown sequence-state identity.");
+    }
+    reclaimable += entries_[it->second].references == 0 ? 1U : 0U;
+  }
+  uint32_t new_rows = 0;
+  for (const SequenceStateAccess& access : accesses) {
+    if ((access.read_position.has_value() &&
+         *access.read_position > std::numeric_limits<int32_t>::max()) ||
+        (access.publish_position.has_value() &&
+         *access.publish_position > std::numeric_limits<int32_t>::max())) {
+      return invalid("Sequence-state position exceeds the model index range.");
+    }
+    if (std::binary_search(
+            retirement_scratch_.begin(),
+            retirement_scratch_.end(),
+            access.key,
+            [](const SequenceStateKey& left, const SequenceStateKey& right) {
+              return map_key(left) < map_key(right);
+            })) {
+      return invalid("Cannot access and retire the same sequence-state key.");
+    }
+    const auto it = rows_by_key_.find(map_key(access.key));
+    if (it == rows_by_key_.end()) {
+      if (access.read_position.has_value()) {
+        return invalid("Sequence-state read has no accepted publication.");
+      }
       ++new_rows;
       continue;
     }
@@ -149,50 +184,51 @@ Status SequenceStatePool::acquire(std::span<const SequenceStateKey> keys,
       return Status(StatusCode::RESOURCE_EXHAUSTED,
                     "Sequence-state reference count exceeds capacity.");
     }
-  }
-  if (new_rows > free_rows_.size()) {
-    return Status(StatusCode::RESOURCE_EXHAUSTED,
-                  "No free sequence-state rows; retire live state first.");
-  }
-  if (keys.empty()) {
-    return Status();
-  }
-  std::vector<SequenceStateHandle> handles;
-  handles.reserve(keys.size());
-  // Every expected rejection precedes row allocation or reference changes.
-  for (const SequenceStateKey& key : keys) {
-    auto it = rows_by_key_.find(map_key(key));
-    if (it == rows_by_key_.end()) {
-      const uint32_t row = free_rows_.back();
-      free_rows_.pop_back();
-      entries_[row].key = key;
-      it = rows_by_key_.emplace(map_key(key), row).first;
+    if (access.read_position.has_value() &&
+        access.read_position != entry.published_position) {
+      return invalid("Sequence-state read does not match accepted position.");
     }
-    Entry& entry = entries_[it->second];
-    ++entry.references;
-    handles.emplace_back(SequenceStateHandle{it->second, entry.generation});
-  }
-  output = SequenceStateLease(*this, std::move(handles));
-  return Status();
-}
-
-Status SequenceStatePool::retire(std::span<const SequenceStateKey> keys) {
-  Status status = validate_keys(keys);
-  if (!status.ok()) {
-    return status;
-  }
-  for (const SequenceStateKey& key : keys) {
-    if (!rows_by_key_.contains(map_key(key))) {
-      return invalid("Cannot retire an unknown sequence-state identity.");
+    if (access.publish_position.has_value() &&
+        entry.published_position.has_value() &&
+        *access.publish_position <= *entry.published_position) {
+      return invalid("Sequence-state publication must advance its position.");
     }
   }
-  for (const SequenceStateKey& key : keys) {
+  if (new_rows > free_rows_.size() + reclaimable) {
+    return Status(
+        StatusCode::RESOURCE_EXHAUSTED,
+        "Sequence-state rows remain live or leased by accepted Tasks.");
+  }
+  // No expected rejection follows this point. Apply the validated retirement
+  // before allocation so one input can replace unleased state in a full pool.
+  for (const SequenceStateKey& key : retired_keys) {
     const uint32_t row = rows_by_key_.at(map_key(key));
     Entry& entry = entries_[row];
     entry.retired = true;
     if (entry.references == 0) {
       reclaim(row);
     }
+  }
+  if (accesses.empty()) {
+    return Status();
+  }
+  CHECK_EQ(output.pool_, nullptr);
+  output.pool_ = this;
+  for (const SequenceStateAccess& access : accesses) {
+    auto it = rows_by_key_.find(map_key(access.key));
+    if (it == rows_by_key_.end()) {
+      const uint32_t row = free_rows_.back();
+      free_rows_.pop_back();
+      entries_[row].key = access.key;
+      it = rows_by_key_.emplace(map_key(access.key), row).first;
+    }
+    Entry& entry = entries_[it->second];
+    ++entry.references;
+    if (access.publish_position.has_value()) {
+      entry.published_position = access.publish_position;
+    }
+    output.handles_.emplace_back(
+        SequenceStateHandle{it->second, entry.generation});
   }
   return Status();
 }
@@ -224,6 +260,7 @@ void SequenceStatePool::reclaim(uint32_t row) {
   CHECK_EQ(rows_by_key_.erase(map_key(entry.key)), 1U);
   entry.key = {};
   entry.retired = false;
+  entry.published_position.reset();
   ++entry.generation;
   free_rows_.emplace_back(row);
 }

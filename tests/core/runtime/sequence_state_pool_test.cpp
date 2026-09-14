@@ -61,11 +61,26 @@ class SequenceStatePoolTest : public ::testing::Test {
 
   Status acquire(std::initializer_list<SequenceStateKey> keys,
                  SequenceStateLease& lease) {
-    return pool_->acquire({keys.begin(), keys.size()}, lease);
+    std::vector<SequenceStateAccess> accesses;
+    accesses.reserve(keys.size());
+    for (const SequenceStateKey& key : keys) {
+      accesses.emplace_back(
+          SequenceStateAccess{key, std::nullopt, std::nullopt});
+    }
+    return pool_->admit(accesses, {}, lease);
   }
 
   Status retire(std::initializer_list<SequenceStateKey> keys) {
-    return pool_->retire({keys.begin(), keys.size()});
+    SequenceStateLease empty(/*capacity=*/4);
+    return pool_->admit({}, {keys.begin(), keys.size()}, empty);
+  }
+
+  Status admit(std::initializer_list<SequenceStateAccess> accesses,
+               std::initializer_list<SequenceStateKey> retired_keys,
+               SequenceStateLease& lease) {
+    return pool_->admit({accesses.begin(), accesses.size()},
+                        {retired_keys.begin(), retired_keys.size()},
+                        lease);
   }
 
   const torch::Device device_{torch::kPrivateUse1, 0};
@@ -96,11 +111,11 @@ TEST_F(SequenceStatePoolTest, FactoryRejectsBeforeReplacingOutput) {
 }
 
 TEST_F(SequenceStatePoolTest, BatchRejectionPreservesRowsAndLease) {
-  SequenceStateLease held;
+  SequenceStateLease held(/*capacity=*/4);
   ASSERT_TRUE(acquire({{10, 0}, {20, 0}, {30, 0}}, held).ok());
   const auto first = held.handles().front();
   const int64_t* storage = pool_->tokens().const_data_ptr<int64_t>();
-  SequenceStateLease rejected;
+  SequenceStateLease rejected(/*capacity=*/4);
   EXPECT_FALSE(acquire({{10, 0}, {40, 0}, {50, 0}}, rejected).ok());
   EXPECT_FALSE(acquire({{40, 0}, {0, 0}}, rejected).ok());
   EXPECT_FALSE(acquire({{40, 0}, {40, 0}}, rejected).ok());
@@ -127,16 +142,16 @@ TEST_F(SequenceStatePoolTest, BatchRejectionPreservesRowsAndLease) {
 }
 
 TEST_F(SequenceStatePoolTest, RetirementWaitsForBothTasksAndSeparatesEpochs) {
-  SequenceStateLease first;
-  SequenceStateLease second;
+  SequenceStateLease first(/*capacity=*/4);
+  SequenceStateLease second(/*capacity=*/4);
   ASSERT_TRUE(acquire({{7, 0}}, first).ok());
   ASSERT_TRUE(acquire({{7, 0}}, second).ok());
   const auto old = first.handles().front();
   ASSERT_TRUE(retire({{7, 0}}).ok());
   ASSERT_TRUE(retire({{7, 0}}).ok());
-  SequenceStateLease rejected;
+  SequenceStateLease rejected(/*capacity=*/4);
   EXPECT_FALSE(acquire({{7, 0}}, rejected).ok());
-  SequenceStateLease recomputed;
+  SequenceStateLease recomputed(/*capacity=*/4);
   ASSERT_TRUE(acquire({{7, 1}}, recomputed).ok());
   EXPECT_NE(recomputed.handles().front().row, old.row);
   first.reset();
@@ -145,7 +160,7 @@ TEST_F(SequenceStatePoolTest, RetirementWaitsForBothTasksAndSeparatesEpochs) {
   second.reset();
   EXPECT_FALSE(pool_->is_current(old));
   EXPECT_EQ(pool_->available_rows(), 3U);
-  SequenceStateLease replacement;
+  SequenceStateLease replacement(/*capacity=*/4);
   ASSERT_TRUE(acquire({{8, 0}}, replacement).ok());
   EXPECT_EQ(replacement.handles().front().row, old.row);
   EXPECT_GT(replacement.handles().front().generation, old.generation);
@@ -154,8 +169,8 @@ TEST_F(SequenceStatePoolTest, RetirementWaitsForBothTasksAndSeparatesEpochs) {
 }
 
 TEST_F(SequenceStatePoolTest, MoveTransfersExactlyOneReferenceSet) {
-  SequenceStateLease original;
-  SequenceStateLease target;
+  SequenceStateLease original(/*capacity=*/4);
+  SequenceStateLease target(/*capacity=*/4);
   ASSERT_TRUE(acquire({{1, 0}}, original).ok());
   ASSERT_TRUE(acquire({{2, 0}}, target).ok());
   const auto one = original.handles().front();
@@ -178,7 +193,7 @@ TEST_F(SequenceStatePoolTest, MoveTransfersExactlyOneReferenceSet) {
 TEST_F(SequenceStatePoolTest, NonAdjacentSequencesKeepRowsAndTokens) {
   Stream stream(device_);
   auto guard = stream.set_stream_guard();
-  SequenceStateLease initial;
+  SequenceStateLease initial(/*capacity=*/4);
   ASSERT_TRUE(acquire({{1, 0}, {2, 0}, {3, 0}}, initial).ok());
   const auto first = initial.handles().front();
   const torch::Tensor index = row_indices(initial, device_);
@@ -189,11 +204,11 @@ TEST_F(SequenceStatePoolTest, NonAdjacentSequencesKeepRowsAndTokens) {
   initial.reset();
   EXPECT_EQ(pool_->available_rows(), 1U);
   {
-    SequenceStateLease unrelated;
+    SequenceStateLease unrelated(/*capacity=*/4);
     ASSERT_TRUE(acquire({{4, 0}}, unrelated).ok());
     ASSERT_TRUE(retire({{4, 0}}).ok());
   }
-  SequenceStateLease reordered;
+  SequenceStateLease reordered(/*capacity=*/4);
   ASSERT_TRUE(acquire({{3, 0}, {1, 0}}, reordered).ok());
   EXPECT_EQ(reordered.handles().back().row, first.row);
   EXPECT_EQ(reordered.handles().back().generation, first.generation);
@@ -206,10 +221,14 @@ TEST_F(SequenceStatePoolTest, NonAdjacentSequencesKeepRowsAndTokens) {
 }
 
 TEST_F(SequenceStatePoolTest, BatchedPublishPrecedesNextTaskGather) {
-  SequenceStateLease task_a;
-  SequenceStateLease task_b;
-  ASSERT_TRUE(acquire({{11, 0}, {22, 0}}, task_a).ok());
-  ASSERT_TRUE(acquire({{22, 0}, {11, 0}}, task_b).ok());
+  SequenceStateLease task_a(/*capacity=*/4);
+  SequenceStateLease task_b(/*capacity=*/4);
+  ASSERT_TRUE(admit({{{11, 0}, std::nullopt, 1}, {{22, 0}, std::nullopt, 1}},
+                    {},
+                    task_a)
+                  .ok());
+  // Accept the read before A actually publishes on the Device stream.
+  ASSERT_TRUE(admit({{{22, 0}, 1, 2}, {{11, 0}, 1, 2}}, {}, task_b).ok());
   Stream stream(device_);
   auto guard = stream.set_stream_guard();
   const torch::Tensor rows_a = row_indices(task_a, device_);
@@ -228,7 +247,7 @@ TEST_F(SequenceStatePoolTest, BatchedPublishPrecedesNextTaskGather) {
   torch::index_select_out(result, pool_->tokens(), /*dim=*/0, rows_a);
   ASSERT_TRUE(retire({{11, 0}, {22, 0}}).ok());
   EXPECT_EQ(pool_->available_rows(), 2U);
-  SequenceStateLease rejected;
+  SequenceStateLease rejected(/*capacity=*/4);
   EXPECT_FALSE(acquire({{11, 0}}, rejected).ok());
   ASSERT_EQ(stream.synchronize(), ACL_SUCCESS);
   EXPECT_TRUE(
@@ -244,7 +263,7 @@ TEST_F(SequenceStatePoolTest, RepeatedEpochsReuseFixedStorage) {
   const int64_t* storage = pool_->tokens().const_data_ptr<int64_t>();
   SequenceStateHandle previous;
   for (uint64_t epoch = 0; epoch < 256; ++epoch) {
-    SequenceStateLease lease;
+    SequenceStateLease lease(/*capacity=*/4);
     ASSERT_TRUE(acquire({{1, epoch}}, lease).ok());
     const auto current = lease.handles().front();
     EXPECT_FALSE(pool_->is_current(previous));
@@ -255,14 +274,206 @@ TEST_F(SequenceStatePoolTest, RepeatedEpochsReuseFixedStorage) {
   EXPECT_EQ(pool_->available_rows(), 4U);
   EXPECT_EQ(pool_->tokens().const_data_ptr<int64_t>(), storage);
   EXPECT_EQ(pool_->device_bytes(), 4 * sizeof(int64_t));
-  SequenceStateLease empty;
+  SequenceStateLease empty(/*capacity=*/4);
   EXPECT_TRUE(acquire({}, empty).ok());
   EXPECT_TRUE(retire({}).ok());
   EXPECT_TRUE(empty.empty());
 }
 
+TEST_F(SequenceStatePoolTest, FullPoolReplacementCommitsAfterAllValidation) {
+  SequenceStateLease initial(/*capacity=*/4);
+  ASSERT_TRUE(acquire({{1, 0}, {2, 0}, {3, 0}, {4, 0}}, initial).ok());
+  const auto old = initial.handles().front();
+  initial.reset();
+  SequenceStateLease replacement(/*capacity=*/4);
+  EXPECT_FALSE(admit({{{5, 0}, 7, std::nullopt}}, {{1, 0}}, replacement).ok());
+  EXPECT_TRUE(replacement.empty());
+  EXPECT_TRUE(pool_->is_current(old));
+  EXPECT_EQ(pool_->available_rows(), 0U);
+  ASSERT_TRUE(admit({{{5, 0}, std::nullopt, 7}}, {{1, 0}}, replacement).ok());
+  ASSERT_EQ(replacement.handles().size(), 1U);
+  EXPECT_EQ(replacement.handles().front().row, old.row);
+  EXPECT_GT(replacement.handles().front().generation, old.generation);
+  EXPECT_FALSE(pool_->is_current(old));
+  EXPECT_EQ(pool_->available_rows(), 0U);
+}
+
+TEST_F(SequenceStatePoolTest, PendingLeasesCannotFundRejectedReplacement) {
+  SequenceStateLease held(/*capacity=*/4);
+  ASSERT_TRUE(acquire({{1, 0}, {2, 0}, {3, 0}, {4, 0}}, held).ok());
+  SequenceStateLease replacement(/*capacity=*/4);
+  const Status rejected =
+      admit({{{5, 0}, std::nullopt, 1}}, {{1, 0}}, replacement);
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_TRUE(replacement.empty());
+  // Failed capacity admission did not even mark the old identity retired.
+  SequenceStateLease still_live(/*capacity=*/1);
+  ASSERT_TRUE(acquire({{1, 0}}, still_live).ok());
+  still_live.reset();
+  held.reset();
+  ASSERT_TRUE(admit({{{5, 0}, std::nullopt, 1}}, {{1, 0}}, replacement).ok());
+}
+
+TEST_F(SequenceStatePoolTest, ReadsRequireExactAcceptedPublication) {
+  SequenceStateLease first(/*capacity=*/4);
+  ASSERT_TRUE(
+      admit({{{1, 0}, std::nullopt, 7}, {{2, 0}, std::nullopt, std::nullopt}},
+            {},
+            first)
+          .ok());
+  SequenceStateLease next(/*capacity=*/4);
+  EXPECT_FALSE(admit({{{2, 0}, 0, std::nullopt}}, {}, next).ok());
+  EXPECT_FALSE(admit({{{1, 0}, 6, 8}}, {}, next).ok());
+  EXPECT_FALSE(admit({{{1, 0}, 8, 9}}, {}, next).ok());
+  EXPECT_FALSE(admit({{{1, 0}, 7, 7}}, {}, next).ok());
+  ASSERT_TRUE(admit({{{1, 0}, 7, 8}}, {}, next).ok());
+  SequenceStateLease observer(/*capacity=*/1);
+  EXPECT_FALSE(admit({{{1, 0}, 7, std::nullopt}}, {}, observer).ok());
+  ASSERT_TRUE(admit({{{1, 0}, 8, std::nullopt}}, {}, observer).ok());
+  EXPECT_EQ(first.handles().front().row, next.handles().front().row);
+}
+
+TEST_F(SequenceStatePoolTest, LaterRejectionPreservesEarlierPublication) {
+  SequenceStateLease initial(/*capacity=*/4);
+  ASSERT_TRUE(admit({{{1, 0}, std::nullopt, 3},
+                     {{2, 0}, std::nullopt, 3},
+                     {{3, 0}, std::nullopt, 3}},
+                    {},
+                    initial)
+                  .ok());
+  const auto retired = initial.handles().back();
+  initial.reset();
+  SequenceStateLease next(/*capacity=*/4);
+  EXPECT_FALSE(admit({{{1, 0}, 3, 4}, {{2, 0}, 2, 4}}, {{3, 0}}, next).ok());
+  EXPECT_TRUE(pool_->is_current(retired));
+  EXPECT_EQ(pool_->available_rows(), 1U);
+  EXPECT_TRUE(next.empty());
+  ASSERT_TRUE(admit({{{1, 0}, 3, 4}, {{2, 0}, 3, 4}}, {{3, 0}}, next).ok());
+  EXPECT_FALSE(pool_->is_current(retired));
+  EXPECT_EQ(pool_->available_rows(), 2U);
+}
+
+TEST_F(SequenceStatePoolTest, FixedLeaseCapacitySurvivesResetAndRejection) {
+  SequenceStateLease lease(/*capacity=*/1);
+  const SequenceStateHandle* storage = lease.handles().data();
+  for (uint64_t epoch = 0; epoch < 256; ++epoch) {
+    EXPECT_FALSE(acquire({{1, epoch}, {2, epoch}}, lease).ok());
+    EXPECT_TRUE(lease.empty());
+    EXPECT_EQ(lease.handles().data(), storage);
+    EXPECT_EQ(pool_->available_rows(), 4U);
+    ASSERT_TRUE(admit({{{1, epoch}, std::nullopt, 7}}, {}, lease).ok());
+    EXPECT_EQ(lease.handles().data(), storage);
+    ASSERT_TRUE(retire({{1, epoch}}).ok());
+    lease.reset();
+    EXPECT_EQ(lease.handles().data(), storage);
+    SequenceStateLease uninitialized(/*capacity=*/1);
+    EXPECT_FALSE(
+        admit({{{1, epoch + 1}, 7, std::nullopt}}, {}, uninitialized).ok());
+  }
+  SequenceStateLease no_capacity;
+  EXPECT_FALSE(acquire({{9, 0}}, no_capacity).ok());
+  EXPECT_TRUE(acquire({}, no_capacity).ok());
+  EXPECT_EQ(pool_->available_rows(), 4U);
+}
+
+TEST_F(SequenceStatePoolTest, TransactionRejectsConflictingKeysAndPositions) {
+  SequenceStateLease held(/*capacity=*/4);
+  ASSERT_TRUE(admit({{{1, 0}, std::nullopt, 1}}, {}, held).ok());
+  const auto handle = held.handles().front();
+  held.reset();
+  SequenceStateLease next(/*capacity=*/4);
+  EXPECT_FALSE(admit({{{1, 0}, 1, 2}}, {{1, 0}}, next).ok());
+  EXPECT_FALSE(admit({{{1, 0}, 1, 2}}, {{9, 0}}, next).ok());
+  EXPECT_FALSE(admit({{{2, 0}, std::nullopt, 1}, {{2, 0}, std::nullopt, 1}},
+                     {{1, 0}},
+                     next)
+                   .ok());
+  EXPECT_FALSE(admit({{{0, 0}, std::nullopt, 1}}, {{1, 0}}, next).ok());
+  EXPECT_FALSE(
+      admit({{{2, 0}, std::nullopt, std::numeric_limits<uint32_t>::max()}},
+            {{1, 0}},
+            next)
+          .ok());
+  EXPECT_FALSE(
+      admit({{{1, 0}, std::numeric_limits<uint32_t>::max(), std::nullopt}},
+            {},
+            next)
+          .ok());
+  EXPECT_FALSE(admit({}, {{1, 0}, {1, 0}}, next).ok());
+  EXPECT_TRUE(pool_->is_current(handle));
+  EXPECT_TRUE(next.empty());
+  EXPECT_EQ(pool_->available_rows(), 3U);
+  ASSERT_TRUE(admit({}, {{1, 0}}, next).ok());
+  EXPECT_FALSE(pool_->is_current(handle));
+  ASSERT_TRUE(
+      admit({{{2, 0}, std::nullopt, std::numeric_limits<int32_t>::max()}},
+            {},
+            next)
+          .ok());
+  next.reset();
+  ASSERT_TRUE(
+      admit({{{2, 0}, std::numeric_limits<int32_t>::max(), std::nullopt}},
+            {},
+            next)
+          .ok());
+}
+
+TEST_F(SequenceStatePoolTest, TransactionAdmissionPerformance) {
+  if (std::getenv(/*name=*/"XLLM_PIPELINE_PERF") == nullptr) {
+    GTEST_SKIP() << "Run separately with XLLM_PIPELINE_PERF=1.";
+  }
+  ASSERT_TRUE(SequenceStatePool::create(/*capacity=*/128, device_, pool_).ok());
+  constexpr int32_t kIterations = 4096;
+  for (uint32_t batch : std::array<uint32_t, 4>{1, 4, 32, 128}) {
+    std::vector<SequenceStateAccess> accesses;
+    std::vector<SequenceStateKey> retired;
+    accesses.reserve(batch);
+    retired.reserve(batch);
+    for (uint32_t row = 0; row < batch; ++row) {
+      accesses.emplace_back(
+          SequenceStateAccess{{row + 1U, 0}, std::nullopt, 1});
+      retired.emplace_back(SequenceStateKey{row + 1U, 0});
+    }
+    SequenceStateLease lease(/*capacity=*/128);
+    ASSERT_TRUE(pool_->admit(accesses, {}, lease).ok());
+    lease.reset();
+    const SequenceStateHandle* storage = lease.handles().data();
+    const auto cycle = [&]() {
+      for (uint32_t row = 0; row < batch; ++row) {
+        retired[row] = accesses[row].key;
+        ++accesses[row].key.epoch;
+      }
+      const Status status = pool_->admit(accesses, retired, lease);
+      CHECK(status.ok()) << status.message();
+      lease.reset();
+    };
+    for (int32_t round = 0; round < 3; ++round) {
+      for (int32_t warmup = 0; warmup < 32; ++warmup) {
+        cycle();
+      }
+      const auto begin = std::chrono::steady_clock::now();
+      for (int32_t step = 0; step < kIterations; ++step) {
+        cycle();
+      }
+      const double us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count() /
+                        kIterations;
+      EXPECT_EQ(lease.handles().data(), storage);
+      EXPECT_EQ(pool_->available_rows(), 128U - batch);
+      LOG(INFO) << "POOL_ADMISSION_PERF rows=" << batch << " round=" << round
+                << " us=" << us << " iterations=" << kIterations;
+    }
+    for (uint32_t row = 0; row < batch; ++row) {
+      retired[row] = accesses[row].key;
+    }
+    ASSERT_TRUE(pool_->admit({}, retired, lease).ok());
+    EXPECT_EQ(pool_->available_rows(), 128U);
+  }
+}
+
 TEST_F(SequenceStatePoolTest, BatchedTokenTransferPerformance) {
-  if (std::getenv("XLLM_PIPELINE_PERF") == nullptr) {
+  if (std::getenv(/*name=*/"XLLM_PIPELINE_PERF") == nullptr) {
     GTEST_SKIP() << "Run separately with XLLM_PIPELINE_PERF=1.";
   }
   ASSERT_TRUE(SequenceStatePool::create(/*capacity=*/128, device_, pool_).ok());
@@ -275,8 +486,14 @@ TEST_F(SequenceStatePoolTest, BatchedTokenTransferPerformance) {
     for (uint32_t row = 0; row < batch; ++row) {
       keys.emplace_back(SequenceStateKey{row + 1U, batch});
     }
-    SequenceStateLease lease;
-    ASSERT_TRUE(pool_->acquire(keys, lease).ok());
+    std::vector<SequenceStateAccess> accesses;
+    accesses.reserve(batch);
+    for (const SequenceStateKey& key : keys) {
+      accesses.emplace_back(
+          SequenceStateAccess{key, std::nullopt, std::nullopt});
+    }
+    SequenceStateLease lease(/*capacity=*/128);
+    ASSERT_TRUE(pool_->admit(accesses, {}, lease).ok());
     const torch::Tensor index = row_indices(lease, device_);
     torch::Tensor values =
         torch::full({batch}, /*fill_value=*/13, pool_->tokens().options());
@@ -314,7 +531,8 @@ TEST_F(SequenceStatePoolTest, BatchedTokenTransferPerformance) {
                 << " completion_us=" << completion_us
                 << " device_bytes=" << pool_->device_bytes();
     }
-    ASSERT_TRUE(pool_->retire(keys).ok());
+    SequenceStateLease retire_only;
+    ASSERT_TRUE(pool_->admit({}, keys, retire_only).ok());
     lease.reset();
     EXPECT_EQ(pool_->available_rows(), 128U);
   }
