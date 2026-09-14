@@ -119,6 +119,7 @@ Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output) {
   const int64_t rows = static_cast<int64_t>(host.q_seq_lens.size());
   if (meta.num_sequences < 0 || meta.actual_num_sequences < 0 ||
       meta.num_sequences != rows ||
+      source.sequence_state_keys.size() != static_cast<uint64_t>(rows) ||
       (meta.actual_num_sequences != 0 && meta.actual_num_sequences != rows) ||
       (empty && rows != 0) ||
       (!empty && (!cpu_int_tensor(tokens, /*dimensions=*/1) ||
@@ -154,6 +155,8 @@ Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output) {
   // singleton DP summaries. They describe scheduler bookkeeping only: the
   // ordinary program reads token/position/KV views, not those algorithm fields.
   input.sampling = source.sampling_params;
+  input.sequence_state_keys = source.sequence_state_keys;
+  input.retired_sequence_state_keys = source.retired_sequence_state_keys;
   output = std::move(input);
   return Status();
 }

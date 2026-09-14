@@ -42,6 +42,9 @@ class ModelInputBinding final {
 
   // Validation failures preserve the previous binding, storage and event.
   // Successful return stabilizes source data, but H2D can remain in flight.
+  // Metadata preparation binds token addresses without reading token values.
+  // The caller may fill unknown tokens after input-ready on the launch stream,
+  // before the original model forward consumes them. Other inputs stay stable.
   Status prepare(const ModelInputHostView& input,
                  const ModelInputBatch& batch,
                  const Stream& stream);

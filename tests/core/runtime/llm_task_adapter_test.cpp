@@ -22,6 +22,7 @@ namespace {
 
 ForwardInput ordinary_input() {
   ForwardInput input;
+  input.sequence_state_keys = {{17, 3}};
   input.token_ids = torch::tensor({11, 12, 13}, torch::kInt32);
   input.positions = torch::tensor({0, 1, 2}, torch::kInt32);
   input.input_params.meta = {BatchForwardType::PREFILL, 1, 0, 3, 3, 42, false};
@@ -48,6 +49,12 @@ TEST(LlmTaskAdapterTest, BorrowsOrdinaryBuilderViewsUntilPrepareAck) {
   source.input_params.meta.is_graph_warmup = true;
   LlmTaskInput task;
   ASSERT_TRUE(make_llm_task_input(source, task).ok());
+  EXPECT_EQ(task.sequence_state_keys.data(), source.sequence_state_keys.data());
+  EXPECT_EQ(task.sequence_state_keys.size(), 1U);
+  source.retired_sequence_state_keys = {{16, 2}};
+  ASSERT_TRUE(make_llm_task_input(source, task).ok());
+  EXPECT_EQ(task.retired_sequence_state_keys.data(),
+            source.retired_sequence_state_keys.data());
   EXPECT_EQ(task.batch.num_actual_sequences, 1);
   EXPECT_EQ(task.batch.batch_id, 42);
   EXPECT_FALSE(task.batch.is_graph_warmup);
@@ -72,6 +79,11 @@ TEST(LlmTaskAdapterTest, EmptyInputAndAbsentSamplingAreValid) {
   EXPECT_TRUE(task.model.token_ids.empty());
   EXPECT_EQ(task.batch.num_actual_sequences, 0);
   EXPECT_FALSE(task.sampling.selected_token_idxes.defined());
+  ForwardInput retired_only;
+  retired_only.retired_sequence_state_keys = {{19, 4}};
+  ASSERT_TRUE(make_llm_task_input(retired_only, task).ok());
+  EXPECT_TRUE(task.sequence_state_keys.empty());
+  ASSERT_EQ(task.retired_sequence_state_keys.size(), 1U);
   auto source = ordinary_input();
   source.sampling_params = {};
   ASSERT_TRUE(make_llm_task_input(source, task).ok());
@@ -90,6 +102,12 @@ TEST(LlmTaskAdapterTest,
     EXPECT_EQ(task.model.token_ids.data(), original);
   };
   auto invalid = ordinary_input();
+  invalid.sequence_state_keys.clear();
+  rejected(invalid);
+  invalid = ordinary_input();
+  invalid.sequence_state_keys.emplace_back(SequenceStateKey{18, 3});
+  rejected(invalid);
+  invalid = ordinary_input();
   invalid.token_ids = invalid.token_ids.to(torch::kInt64);
   rejected(invalid);
   invalid = ordinary_input();

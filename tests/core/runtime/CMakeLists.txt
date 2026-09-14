@@ -21,6 +21,16 @@ cc_test(
 
 if(USE_NPU)
   cc_test(
+    NAME sequence_token_binding_test
+    SRCS sequence_token_binding_test.cpp
+    DEPS :task_pipeline_sequence_token_binding GTest::gtest_main
+  )
+  target_link_options(sequence_token_binding_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
     NAME sequence_state_pool_test
     SRCS sequence_state_pool_test.cpp
     DEPS :task_pipeline_sequence_state_pool :platform GTest::gtest_main

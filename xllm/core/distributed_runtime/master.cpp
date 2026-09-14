@@ -590,6 +590,8 @@ Master::Master(const Options& options, EngineType type)
         .max_tokens_per_batch(options_.max_tokens_per_batch())
         .max_seqs_per_batch(options_.max_seqs_per_batch())
         .task_pipeline_slots(options_.task_pipeline_slots())
+        .task_pipeline_max_live_sequences(
+            options_.task_pipeline_max_live_sequences())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -687,6 +689,8 @@ Master::Master(const Options& options, EngineType type)
         .output_shm_size(options_.output_shm_size() * 1024 * 1024)
         .is_local(options_.is_local())
         .task_pipeline_slots(options_.task_pipeline_slots())
+        .task_pipeline_max_live_sequences(
+            options_.task_pipeline_max_live_sequences())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -754,6 +758,8 @@ Master::Master(const Options& options, EngineType type)
         .is_local(options_.is_local())
         .server_idx(options_.server_idx())
         .task_pipeline_slots(options_.task_pipeline_slots())
+        .task_pipeline_max_live_sequences(
+            options_.task_pipeline_max_live_sequences())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())
@@ -797,6 +803,8 @@ Master::Master(const Options& options, EngineType type)
         .beam_width(options_.beam_width())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
         .task_pipeline_slots(options_.task_pipeline_slots())
+        .task_pipeline_max_live_sequences(
+            options_.task_pipeline_max_live_sequences())
         .enable_graph(options_.enable_graph())
         .enable_graph_mode_decode_no_padding(
             options_.enable_graph_mode_decode_no_padding())

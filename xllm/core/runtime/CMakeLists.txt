@@ -16,6 +16,13 @@ cc_library(
 
 if(USE_NPU)
   cc_library(
+    NAME task_pipeline_sequence_token_binding
+    HDRS task_pipeline/sequence_token_binding.h
+    SRCS task_pipeline/sequence_token_binding.cpp
+    DEPS :task_pipeline_sequence_state_pool :task_pipeline_model_input_binding
+  )
+
+  cc_library(
     NAME task_pipeline_sequence_state_pool
     HDRS task_pipeline/sequence_state_pool.h
     SRCS task_pipeline/sequence_state_pool.cpp
@@ -173,6 +180,7 @@ cc_library(
     :task_pipeline_model_input_layout
     $<$<BOOL:${USE_NPU}>:task_pipeline_sampling_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_token_result_storage>
+    $<$<BOOL:${USE_NPU}>:task_pipeline_sequence_token_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_binding>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_storage>
     $<$<BOOL:${USE_NPU}>:task_pipeline_model_input_preparer>

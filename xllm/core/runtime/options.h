@@ -267,6 +267,7 @@ struct Options {
 
   // 0 uses the existing executor; 1 enables the single-Slot task pipeline.
   PROPERTY(int32_t, task_pipeline_slots) = 0;
+  PROPERTY(int32_t, task_pipeline_max_live_sequences) = 1024;
 
   // enable CUDA graph/ACL graph for performance optimization
   PROPERTY(bool, enable_graph) = false;

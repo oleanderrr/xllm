@@ -525,8 +525,11 @@ TEST_P(Qwen3SlotForwardTest, TwoSlotsShareWorkspaceAndKeepPrivateInputs) {
     ASSERT_NE(program, nullptr);
     EXPECT_EQ(program->slot_count(), 2);
     EXPECT_GT(shared_bytes, 0);
-    EXPECT_EQ(program->shared_device_bytes(), shared_bytes);
-    EXPECT_EQ(program->device_bytes(), shared_bytes + 2 * private_bytes);
+    // A second Slot adds three conservative in-flight epoch rows.
+    EXPECT_EQ(program->shared_device_bytes(),
+              shared_bytes + 3 * sizeof(int64_t));
+    EXPECT_EQ(program->device_bytes(),
+              program->shared_device_bytes() + 2 * private_bytes);
     EXPECT_EQ(program->pinned_bytes(), 2 * pinned_bytes);
     EXPECT_EQ(program->slot_device_bytes(/*slot_id=*/1), private_bytes);
     std::vector<TokenResultTensors> retained;
@@ -747,6 +750,224 @@ TEST_P(Qwen3SlotForwardTest, TwoSlotPipelineDrainsUnclaimedAndPendingResults) {
               StatusCode::INVALID_ARGUMENT);
     EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
     compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest,
+       SequenceStateFeedsTwoSlotsAcrossContinuousRowPermutation) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    const auto reference = [&](const BatchData& batch,
+                               BatchForwardType phase,
+                               const SamplingParameters& params) {
+      return this->reference(batch, phase, params, parameter_dtype);
+    };
+
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    constexpr uint32_t kTasks = 9;
+    std::vector<BatchData> batches;
+    std::vector<SamplingParameters> parameters;
+    std::vector<SampleOutput> expected;
+    std::vector<std::array<SequenceStateKey, 2>> keys;
+    batches.reserve(kTasks);
+    parameters.reserve(kTasks);
+    expected.reserve(kTasks);
+    keys.reserve(kTasks);
+    const auto rng_before = pipeline_rng_state();
+    for (uint32_t step = 0; step < kTasks; ++step) {
+      const std::array<uint32_t, 2> order = step % 2 == 0
+                                                ? std::array<uint32_t, 2>{0, 1}
+                                                : std::array<uint32_t, 2>{1, 0};
+      const std::array<int32_t, 2> prompt{5, 3};
+      BatchData batch =
+          step == 0
+              ? make_batch(/*q=*/{5, 3}, /*kv=*/{5, 3})
+              : make_batch(
+                    /*q=*/{1, 1},
+                    /*kv=*/{prompt[order[0]] + static_cast<int32_t>(step),
+                            prompt[order[1]] + static_cast<int32_t>(step)});
+      if (step > 0) {
+        for (uint32_t row = 0; row < 2; ++row) {
+          batch.blocks[row] = static_cast<int32_t>(order[row]);
+          batch.slots[row] =
+              static_cast<int32_t>(128 * order[row]) + batch.positions[row];
+          // Every decode flips row order relative to its predecessor.
+          batch.tokens[row] = static_cast<int32_t>(
+              expected.back().next_tokens[1 - row].item<int64_t>());
+        }
+      }
+      auto params = sampling_for(batch, static_cast<int32_t>(step % 3));
+      auto result = reference(
+          batch,
+          step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE,
+          params);
+      batches.emplace_back(std::move(batch));
+      parameters.emplace_back(std::move(params));
+      expected.emplace_back(std::move(result));
+      keys.emplace_back(
+          std::array<SequenceStateKey, 2>{SequenceStateKey{101 + order[0], 0},
+                                          SequenceStateKey{101 + order[1], 0}});
+    }
+    const auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    std::vector<uint64_t> tickets;
+    std::vector<TokenResultTensors> retained;
+    std::vector<torch::Tensor> snapshots;
+    tickets.reserve(kTasks);
+    retained.reserve(kTasks);
+    snapshots.reserve(kTasks);
+    const auto submit = [&](uint32_t step) {
+      if (step > 0) {
+        // These values carry no row index: identity and position authorize
+        // reads.
+        batches[step].tokens = {-7, -901};
+      }
+      const auto accepted = pipeline->submit(
+          {view(batches[step]),
+           {step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE,
+            2},
+           parameters[step],
+           keys[step],
+           {}});
+      EXPECT_TRUE(accepted.status.ok()) << accepted.status.message();
+      tickets.emplace_back(accepted.task_id);
+      // PrepareAck released every caller borrow, including identity and
+      // sampling.
+      batches[step].tokens.assign(batches[step].tokens.size(), -999);
+      parameters[step].top_p.zero_();
+      keys[step] = {};
+    };
+    submit(/*step=*/0);
+    submit(/*step=*/1);
+    for (uint32_t step = 0; step < kTasks; ++step) {
+      auto actual = pipeline->take_result_async(tickets[step]).get();
+      compare_result(actual, expected[step]);
+      snapshots.emplace_back(actual.tokens.tokens.clone());
+      retained.emplace_back(std::move(actual.tokens));
+      if (step + 2 < kTasks) {
+        submit(step + 2);
+      }
+    }
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    const std::array<SequenceStateKey, 2> retired{{{101, 0}, {102, 0}}};
+    BatchData empty;
+    const auto control = pipeline->submit(
+        {view(empty), {BatchForwardType::EMPTY, 0}, {}, {}, retired});
+    ASSERT_TRUE(control.status.ok());
+    auto control_result = pipeline->take_result_async(control.task_id).get();
+    EXPECT_TRUE(control_result.status.ok());
+    EXPECT_FALSE(control_result.tokens.tokens.defined());
+    pipeline.reset();
+    for (uint32_t index = 0; index < retained.size(); ++index) {
+      EXPECT_TRUE(torch::equal(retained[index].tokens, snapshots[index]));
+    }
+    compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest,
+       SequenceStateHandlesUnsampledRowsResetAndUnclaimedDestruction) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    const auto reference = [&](const BatchData& batch,
+                               BatchForwardType phase,
+                               const SamplingParameters& params) {
+      return this->reference(batch, phase, params, parameter_dtype);
+    };
+
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    const std::array<SequenceStateKey, 2> first_keys{{{201, 0}, {202, 0}}};
+    const std::array<SequenceStateKey, 2> second_keys{{{202, 0}, {201, 0}}};
+    auto first = make_batch(/*q=*/{2, 1}, /*kv=*/{2, 1});
+    auto one_row = make_batch(/*q=*/{1}, /*kv=*/{1});
+    auto first_params = sampling_for(one_row, /*mode=*/0);
+    first_params.selected_token_idxes = torch::tensor({2}, torch::kInt32);
+    auto second = make_batch(/*q=*/{1, GetParam() ? 2 : 1},
+                             /*kv=*/{2, GetParam() ? 4 : 3});
+    second.blocks = {1, 0};
+    for (uint32_t offset = 0; offset < second.slots.size(); ++offset) {
+      second.slots[offset] = (offset == 0 ? 128 : 0) + second.positions[offset];
+    }
+    auto second_params = sampling_for(second, /*mode=*/2);
+    const BatchForwardType second_phase =
+        GetParam() ? BatchForwardType::MIXED : BatchForwardType::DECODE;
+    auto rng_before = pipeline_rng_state();
+    auto expected_first =
+        reference(first, BatchForwardType::PREFILL, first_params);
+    second.tokens[0] =
+        static_cast<int32_t>(expected_first.next_tokens[0].item<int64_t>());
+    auto expected_second = reference(second, second_phase, second_params);
+    auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    const auto a = pipeline->submit({view(first),
+                                     {BatchForwardType::PREFILL, 2},
+                                     first_params,
+                                     first_keys,
+                                     {}});
+    ASSERT_TRUE(a.status.ok());
+    second.tokens[0] = -7;
+    const auto b = pipeline->submit(
+        {view(second), {second_phase, 2}, second_params, second_keys, {}});
+    ASSERT_TRUE(b.status.ok()) << b.status.message();
+    auto result_a = pipeline->take_result_async(a.task_id).get();
+    auto result_b = pipeline->take_result_async(b.task_id).get();
+    compare_result(result_a, expected_first);
+    compare_result(result_b, expected_second);
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    compare_kv();
+
+    const std::array<SequenceStateKey, 1> reset_key{{{201, 1}}};
+    auto unknown = make_batch(/*q=*/{1}, /*kv=*/{1});
+    unknown.tokens[0] = -1;
+    auto unknown_params = sampling_for(unknown, /*mode=*/0);
+    const auto rejected = pipeline->submit({view(unknown),
+                                            {BatchForwardType::DECODE, 1},
+                                            unknown_params,
+                                            reset_key,
+                                            first_keys});
+    EXPECT_EQ(rejected.status.code(), StatusCode::INVALID_ARGUMENT);
+    // Rejection cannot retire old identities or advance RNG before this retry.
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    auto reset = make_batch(/*q=*/{2}, /*kv=*/{2});
+    auto reset_params = sampling_for(reset, /*mode=*/1);
+    auto next = make_batch(/*q=*/{1}, /*kv=*/{3});
+    auto next_params = sampling_for(next, /*mode=*/0);
+    rng_before = pipeline_rng_state();
+    auto expected_reset =
+        reference(reset, BatchForwardType::PREFILL, reset_params);
+    next.tokens[0] =
+        static_cast<int32_t>(expected_reset.next_tokens[0].item<int64_t>());
+    reference(next, BatchForwardType::DECODE, next_params);
+    expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    const auto c = pipeline->submit({view(reset),
+                                     {BatchForwardType::PREFILL, 1},
+                                     reset_params,
+                                     reset_key,
+                                     first_keys});
+    ASSERT_TRUE(c.status.ok()) << c.status.message();
+    next.tokens[0] = -91;
+    const auto d = pipeline->submit({view(next),
+                                     {BatchForwardType::DECODE, 1},
+                                     next_params,
+                                     reset_key,
+                                     {}});
+    ASSERT_TRUE(d.status.ok()) << d.status.message();
+    // Both accepted publications execute and retire even when no result is
+    // taken.
+    pipeline.reset();
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    compare_kv();
+    EXPECT_TRUE(torch::equal(result_a.tokens.tokens.squeeze(/*dim=*/1),
+                             expected_first.next_tokens));
+    EXPECT_TRUE(torch::equal(result_b.tokens.tokens.squeeze(/*dim=*/1),
+                             expected_second.next_tokens));
   }
 }
 

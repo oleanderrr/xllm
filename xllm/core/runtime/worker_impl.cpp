@@ -1924,11 +1924,15 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
       args.hidden_size() <= 0 ||
       args.hidden_size() > std::numeric_limits<int32_t>::max() ||
       options_.block_size() <= 0 || options_.max_tokens_per_batch() <= 0 ||
-      options_.max_seqs_per_batch() <= 0) {
+      options_.max_seqs_per_batch() <= 0 ||
+      options_.task_pipeline_max_live_sequences() <= 0) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
                           "Invalid fixed task pipeline capacity.");
   }
   LlmTaskCapacity capacity;
+  capacity.slot_count = static_cast<uint32_t>(options_.task_pipeline_slots());
+  capacity.max_live_sequences =
+      static_cast<uint32_t>(options_.task_pipeline_max_live_sequences());
   capacity.model = {
       static_cast<uint32_t>(options_.max_tokens_per_batch()),
       static_cast<uint32_t>(options_.max_seqs_per_batch()),
@@ -1954,8 +1958,9 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
   if (!status.ok()) {
     return status;
   }
-  LOG(INFO) << "Task execution pipeline: slots=1, tokens="
-            << capacity.model.max_tokens
+  LOG(INFO) << "Task execution pipeline: slots=" << capacity.slot_count
+            << ", live_sequences=" << capacity.max_live_sequences
+            << ", tokens=" << capacity.model.max_tokens
             << ", sequences=" << capacity.model.max_sequences
             << ", sampling_dtype=" << capacity.parameter_dtype
             << ", positions=" << positions

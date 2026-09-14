@@ -20,6 +20,7 @@ limitations under the License.
 #include "core/runtime/executor.h"
 #include "core/runtime/task_pipeline/model_input_binding.h"
 #include "core/runtime/task_pipeline/sampling_input_binding.h"
+#include "core/runtime/task_pipeline/sequence_token_binding.h"
 #include "core/runtime/task_pipeline/token_result_storage.h"
 
 namespace xllm {
@@ -29,6 +30,7 @@ namespace xllm {
 // populated afterwards.
 struct LlmTaskCapacity {
   uint32_t slot_count = 1;
+  uint32_t max_live_sequences = 1024;
   ModelInputCapacity model;
   uint32_t max_kv_seq_len = 0;
   uint32_t max_positions = 0;
@@ -41,12 +43,14 @@ struct LlmTaskCapacity {
   bool chunked_prefill = false;
 };
 
-// Borrows CPU input only until submit's Prepare Ack. No Device input or
-// previous-task placeholder is admitted by the single-Slot ordinary program.
+// Borrows CPU input only until submit's Prepare Ack. Explicit Sequence keys
+// enable cross-Task token state; without them every input token must be known.
 struct LlmTaskInput {
   ModelInputHostView model;
   ModelInputBatch batch;
   SamplingParameters sampling;
+  std::span<const SequenceStateKey> sequence_state_keys;
+  std::span<const SequenceStateKey> retired_sequence_state_keys;
 };
 
 // One ordinary LLM program with private storage for each admitted Slot.
@@ -70,7 +74,9 @@ class LlmTaskProgram final {
   TokenResultTensors consume(uint32_t slot_id);
   void discard(uint32_t slot_id);
   uint32_t slot_count() const { return capacity_.slot_count; }
-  uint64_t shared_device_bytes() const { return sampler_->device_bytes(); }
+  uint64_t shared_device_bytes() const {
+    return sampler_->device_bytes() + sequence_state_pool_->device_bytes();
+  }
   uint64_t slot_device_bytes(uint32_t slot_id) const;
   uint64_t slot_pinned_bytes(uint32_t slot_id) const;
   uint64_t pinned_bytes() const;
@@ -82,6 +88,7 @@ class LlmTaskProgram final {
     StreamEventPtr output_ready;
     std::unique_ptr<ModelInputStorage> storage;
     std::unique_ptr<ModelInputBinding> model_input;
+    std::unique_ptr<SequenceTokenBinding> sequence_tokens;
     std::unique_ptr<SamplingInputBinding> sampling_input;
     std::unique_ptr<TokenResultStorage> result;
     std::unique_ptr<PreparedSamplingInvocation> sampling;
@@ -106,6 +113,8 @@ class LlmTaskProgram final {
   Stream task_stream_;
   Stream result_stream_;
   std::unique_ptr<PreparedSampler> sampler_;
+  // Destroy every Slot and its row lease before the shared pool.
+  std::unique_ptr<SequenceStatePool> sequence_state_pool_;
   std::vector<std::unique_ptr<Slot>> slots_;
 };
 
