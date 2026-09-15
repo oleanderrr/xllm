@@ -85,8 +85,9 @@ int32_t maximum(const std::vector<int32_t>& values) {
 
 }  // namespace
 
-ModelInputBinding::ModelInputBinding(ModelInputStorage& storage)
-    : storage_(storage), preparer_(storage) {
+ModelInputBinding::ModelInputBinding(ModelInputStorage& storage,
+                                     bool enable_mla)
+    : storage_(storage), enable_mla_(enable_mla), preparer_(storage) {
   const ModelInputCapacity& capacity = storage.layout().capacity;
   AttentionHostInput& host = params_.attention.host;
   for (std::vector<int32_t>* lengths : {&host.q_seq_lens,
@@ -174,7 +175,7 @@ Status ModelInputBinding::prepare(const ModelInputHostView& input,
   metadata.q_cu_seq_lens = attention.q_cu_seq_lens;
   metadata.qo_indptr = attention.q_cu_seq_lens;
   metadata.slot_mapping = attention.new_cache_slots;
-  metadata.block_table = batch.forward_type.is_prefill()
+  metadata.block_table = batch.forward_type.is_prefill() && !enable_mla_
                              ? torch::Tensor()
                              : attention.block_tables;
   metadata.q_seq_lens_vec.assign(host.q_seq_lens.begin(),

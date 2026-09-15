@@ -150,3 +150,24 @@ def test_unplanned_capture_is_rejected_before_work(runner: DecodeAclGraphRunner)
         runner.warmup_prepared(torch.zeros(3), torch.zeros(3), _metadata(3))
     runner._capture.assert_not_called()
     runner.attention_backend.prepare.assert_not_called()
+
+
+def test_prepared_mla_capture_reprepares_each_forward_and_binds_query_ends(runner: DecodeAclGraphRunner) -> None:
+    runner.attention_backend.is_mla = True
+    runner.model = Mock(return_value=torch.ones(2, 8))
+    tokens = torch.arange(2, dtype=torch.int32)
+    positions = torch.zeros_like(tokens)
+    metadata = _metadata(2)
+    runner.warmup_prepared(tokens, positions, metadata)
+    runner.freeze_prepared()
+    entry = runner.select_prepared(tokens, positions, metadata).entry
+    assert entry.static_metadata.prepared_attention_state is metadata.prepared_attention_state
+    assert entry.static_metadata.q_cu_seq_lens is metadata.q_cu_seq_lens
+    runner.attention_backend.prepare.reset_mock()
+    runner._forward_static(entry)
+    runner._forward_static(entry)
+    assert runner.attention_backend.prepare.call_count == 2
+    runner.attention_backend.prepare.assert_called_with(entry.static_metadata, graph_mode=True)
+    metadata.q_cu_seq_lens = metadata.q_cu_seq_lens.clone()
+    assert runner.select_prepared(tokens, positions, metadata).miss_reason == "binding_not_captured"
+    assert runner._capture.call_count == 1

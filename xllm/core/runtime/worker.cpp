@@ -21,6 +21,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
 #if defined(USE_NPU)
 #include "core/runtime/task_pipeline/llm_task_adapter.h"
 #include "core/runtime/task_pipeline/task_execution_pipeline.h"
@@ -91,10 +92,11 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !EPLBConfig::get_instance().enable_eplb() &&
           !KVCacheConfig::get_instance().enable_xtensor() &&
           !LoadConfig::get_instance().enable_rolling_load() &&
-          parallel_args.world_size() == 1 && parallel_args.dp_size() == 1 &&
-          parallel_args.cp_size() == 1 && parallel_args.ep_size() == 1)
-        << "Task pipeline currently requires single-rank ordinary Python LLM, "
-           "without offload, disaggregation or sleep.";
+          parallel_args.dp_size() == 1 && parallel_args.cp_size() == 1 &&
+          ParallelConfig::get_instance().kv_split_size_effective() == 1 &&
+          ParallelConfig::get_instance().layerwise_split_size() == 1)
+        << "Task pipeline requires ordinary Python LLM with DP/CP/KV/layerwise "
+           "splits of one, without offload, disaggregation or sleep.";
   }
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();

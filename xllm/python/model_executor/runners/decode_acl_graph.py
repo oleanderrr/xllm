@@ -86,6 +86,7 @@ class _StaticAttentionMetadata:
     kv_split_size: int = 1
     kv_split_rank: int = 0
     has_kv_shard: bool = False
+    prepared_attention_state: object | None = None
 
 
 class _DecodeGraphEntry:
@@ -162,7 +163,7 @@ class DecodeAclGraphRunner(BaseRunner):
     def prepared_batch_sizes(self) -> list[int]:
         """Exact buckets avoid introducing dummy model or sampling rows."""
         if self.dp_size != 1 or self.num_decoding_tokens != 1:
-            raise ValueError("prepared ACL graphs require ordinary single-rank decode")
+            raise ValueError("prepared ACL graphs require DP=1 and one decode token per sequence")
         return list(reversed(_decode_graph_buckets(self.max_batch, 1)))
 
     @staticmethod
@@ -177,6 +178,7 @@ class DecodeAclGraphRunner(BaseRunner):
             metadata.slot_mapping,
             metadata.block_table,
             metadata.q_seq_lens,
+            getattr(metadata, "q_cu_seq_lens", None),
             metadata.kv_seq_lens,
         )
         return tuple(
@@ -262,6 +264,9 @@ class DecodeAclGraphRunner(BaseRunner):
             q_cu_seq_lens=metadata.q_cu_seq_lens,
             kv_seq_lens=metadata.kv_seq_lens,
             kv_seq_lens_host_values=list(metadata.kv_seq_lens_host_values),
+            prepared_attention_state=(
+                metadata.prepared_attention_state if getattr(self.attention_backend, "is_mla", False) else None
+            ),
         )
         self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
         self._capture(entry, torch.npu.current_stream(self.device))
@@ -1043,6 +1048,10 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.graph_tasks = capture_context.tasks
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> torch.Tensor:
+        if entry.static_metadata.prepared_attention_state is not None:
+            # Quant-indexer metadata must be computed inside capture against
+            # the Slot length tensors, not reused from capture warmup.
+            self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
         if entry.static_input_embedding is None:
             return self.model(entry.static_input_ids, entry.static_positions)
         return self.model(

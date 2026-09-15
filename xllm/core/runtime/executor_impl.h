@@ -58,6 +58,12 @@ class ExecutorImpl {
 
   virtual std::vector<int64_t> prepared_graph_batch_sizes() { return {}; }
   virtual void freeze_prepared_graphs() {}
+  virtual torch::Tensor prepared_logits(
+      const torch::Tensor& /*hidden_states*/,
+      const torch::Tensor& /*selected_idxes*/) {
+    LOG(FATAL) << "Executor does not support prepared logits.";
+    return {};
+  }
 
   // tokens: vector size is dp_size, each element is [num_tokens/dp_size]
   // positions: vector size is dp_size, each element is [num_tokens/dp_size]

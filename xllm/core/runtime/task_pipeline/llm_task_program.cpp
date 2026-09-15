@@ -123,7 +123,8 @@ Status LlmTaskProgram::create(CausalLM& model,
     if (!status.ok()) {
       return status;
     }
-    slot->model_input = std::make_unique<ModelInputBinding>(*slot->storage);
+    slot->model_input = std::make_unique<ModelInputBinding>(
+        *slot->storage, capacity.enable_mla);
     status = SequenceTokenBinding::create(
         *program->sequence_state_pool_, rows, slot->sequence_tokens);
     if (!status.ok()) {
@@ -154,7 +155,7 @@ Status LlmTaskProgram::create(CausalLM& model,
   // in admission/Launch. Keep its inputs/output alive through initialization.
   auto hidden = torch::zeros({1, capacity.hidden_size}, model.options());
   auto selected = torch::zeros({1}, model.options().dtype(torch::kInt32));
-  auto logits = model.logits(hidden, selected);
+  auto logits = executor.prepared_logits(hidden, selected);
   if (logits.dim() != 2 || logits.size(/*dim=*/0) != 1 ||
       logits.size(/*dim=*/1) != capacity.vocab_size ||
       logits.stride(/*dim=*/1) != 1 ||
@@ -367,8 +368,8 @@ void LlmTaskProgram::launch(uint32_t slot_id) {
   const auto& params = slot.sampling_input->params();
   if (params.selected_token_idxes.defined() &&
       params.selected_token_idxes.numel() != 0) {
-    slot.logits = model_.logits(slot.model_output.hidden_states,
-                                params.selected_token_idxes);
+    slot.logits = executor_.prepared_logits(slot.model_output.hidden_states,
+                                            params.selected_token_idxes);
     slot.sampling->run(slot.logits);
   }
   slot.sequence_tokens->publish(slot.result->device().tokens);

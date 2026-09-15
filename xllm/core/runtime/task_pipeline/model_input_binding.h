@@ -28,12 +28,13 @@ struct ModelInputBatch {
   bool is_graph_warmup = false;
 };
 
-// Binds ordinary Python non-MLA input and paged-attention metadata. Shared
+// Binds ordinary Python input and paged/MLA attention metadata. Shared
 // KV/state dependencies are established by the caller before execution.
 // Borrows storage until all model readers and event waits have completed.
 class ModelInputBinding final {
  public:
-  explicit ModelInputBinding(ModelInputStorage& storage);
+  explicit ModelInputBinding(ModelInputStorage& storage,
+                             bool enable_mla = false);
   ModelInputBinding(const ModelInputBinding&) = delete;
   ModelInputBinding& operator=(const ModelInputBinding&) = delete;
 
@@ -60,6 +61,7 @@ class ModelInputBinding final {
 
  private:
   ModelInputStorage& storage_;
+  bool enable_mla_;
   ModelInputPreparer preparer_;
   ModelInputParams params_;
   torch::Tensor tokens_;

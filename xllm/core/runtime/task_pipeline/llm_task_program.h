@@ -41,6 +41,7 @@ struct LlmTaskCapacity {
   uint32_t hidden_size = 0;
   torch::ScalarType parameter_dtype = torch::kFloat32;
   bool chunked_prefill = false;
+  bool enable_mla = false;
 };
 
 // Borrows CPU input only until submit's Prepare Ack. Explicit Sequence keys

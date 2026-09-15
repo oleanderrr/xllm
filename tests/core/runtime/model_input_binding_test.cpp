@@ -79,7 +79,9 @@ class ModelInputBindingTest : public ::testing::Test {
     consumer_ = std::make_unique<Stream>(storage_->device_buffer().device());
     storage_->host_buffer().fill_(17);
     storage_->device_buffer().fill_(-23);
-    ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+    // Flush the framework queue as well as the device before direct ACL H2D.
+    c10_npu::getCurrentNPUStream(storage_->device_buffer().device().index())
+        .synchronize();
   }
 
   void expect_device_input(const InputData& input) {
@@ -363,6 +365,40 @@ TEST_F(ModelInputBindingTest, PythonMetadataIsPrivateAndUsesFixedViews) {
   EXPECT_NE(metadata, other.params().attn_metadata);
   EXPECT_TRUE(other.params().attn_metadata->block_table.defined());
   ASSERT_EQ(transfer_->synchronize(), 0);
+}
+
+TEST_F(ModelInputBindingTest, MlaKeepsFinalBlockTableForEveryForwardType) {
+  binding_ =
+      std::make_unique<ModelInputBinding>(*storage_, /*enable_mla=*/true);
+  const std::array<BatchForwardType, 4> types = {
+      BatchForwardType::PREFILL,
+      BatchForwardType::CHUNKED_PREFILL,
+      BatchForwardType::MIXED,
+      BatchForwardType::DECODE};
+  for (const BatchForwardType type : types) {
+    SCOPED_TRACE(type.value());
+    const bool decode = type.is_decode();
+    const InputData input = make_input(
+        decode ? std::vector<int32_t>{1, 1} : std::vector<int32_t>{3, 2},
+        type.is_prefill() ? std::vector<int32_t>{3, 2}
+                          : std::vector<int32_t>{6, 4});
+    ASSERT_TRUE(binding_->prepare(view(input), {type, 2}, *transfer_).ok());
+    expect_device_input(input);
+    const auto metadata = binding_->params().attn_metadata;
+    ASSERT_TRUE(metadata->block_table.defined());
+    EXPECT_EQ(metadata->block_table.data_ptr(),
+              storage_->device().block_tables.data_ptr());
+    EXPECT_EQ(metadata->q_cu_seq_lens.data_ptr(),
+              storage_->device().q_cu_seq_lens.data_ptr());
+    EXPECT_EQ(metadata->kv_seq_lens.data_ptr(),
+              storage_->device().kv_seq_lens.data_ptr());
+    EXPECT_EQ(metadata->slot_mapping.data_ptr(),
+              storage_->device().new_cache_slots.data_ptr());
+    EXPECT_EQ(
+        metadata->q_cu_seq_lens_host_vec,
+        (decode ? std::vector<int64_t>{1, 2} : std::vector<int64_t>{3, 5}));
+    EXPECT_EQ(metadata->kv_seq_lens_vec, input.kv);
+  }
 }
 
 }  // namespace

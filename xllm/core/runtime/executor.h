@@ -41,6 +41,10 @@ class Executor final {
   bool supports_prepared_attention_metadata() const;
   std::vector<int64_t> prepared_graph_batch_sizes();
   void freeze_prepared_graphs();
+  // Pipeline initialization can call the LM head before any model forward.
+  // Bind the backend's thread-local communication context on every call.
+  torch::Tensor prepared_logits(const torch::Tensor& hidden_states,
+                                const torch::Tensor& selected_idxes);
   // Called on Prepare after binding Slot-owned tensor and native metadata.
   // No model computation; the supported backend must not mutate active state.
   void prepare_attention_metadata(std::vector<KVCache>& kv_caches,

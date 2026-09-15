@@ -1957,6 +1957,7 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
                                  ? torch::kFloat32
                                  : dtype_;
   capacity.chunked_prefill = options_.enable_chunked_prefill();
+  capacity.enable_mla = args.enable_mla();
   std::unique_ptr<LlmTaskProgram> program;
   ::xllm::Status status = LlmTaskProgram::create(
       *model_, *model_executor_, kv_caches_, capacity, program);

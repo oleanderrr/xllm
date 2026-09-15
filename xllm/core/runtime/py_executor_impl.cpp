@@ -178,10 +178,13 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
     if (options_.task_pipeline_slots() != 0) {
-      prepared_kv_bindings_.reserve(2 * kv_caches.size());
+      prepared_kv_bindings_.reserve(4 * kv_caches.size());
       for (const auto& kv : kv_caches) {
         prepared_kv_bindings_.emplace_back(kv.get_k_cache());
         prepared_kv_bindings_.emplace_back(kv.get_v_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_index_cache());
+        prepared_kv_bindings_.emplace_back(
+            kv.get_indexer_cache_scale().value_or(torch::Tensor()));
       }
     }
   } else {
@@ -190,8 +193,17 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
     if (options_.task_pipeline_slots() != 0) {
       size_t index = 0;
       for (const auto& kv : kv_caches) {
-        for (const auto& current : {kv.get_k_cache(), kv.get_v_cache()}) {
+        for (const auto& current :
+             {kv.get_k_cache(),
+              kv.get_v_cache(),
+              kv.get_index_cache(),
+              kv.get_indexer_cache_scale().value_or(torch::Tensor())}) {
           const auto& bound = prepared_kv_bindings_[index++];
+          CHECK_EQ(current.defined(), bound.defined())
+              << "Prepared executor KV binding presence changed.";
+          if (!current.defined()) {
+            continue;
+          }
           CHECK(current.data_ptr() == bound.data_ptr() &&
                 current.sizes() == bound.sizes() &&
                 current.strides() == bound.strides() &&
@@ -225,6 +237,13 @@ std::vector<int64_t> PyExecutorImpl::prepared_graph_batch_sizes() {
   py::gil_scoped_acquire gil;
   return py_executor_.attr("prepared_graph_batch_sizes")()
       .cast<std::vector<int64_t>>();
+}
+
+torch::Tensor PyExecutorImpl::prepared_logits(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& selected_idxes) {
+  active_py_causal_lm = py_causal_lm_;
+  return py_causal_lm_->logits(hidden_states, selected_idxes);
 }
 
 void PyExecutorImpl::freeze_prepared_graphs() {

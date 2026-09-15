@@ -23,6 +23,11 @@ limitations under the License.
 
 namespace xllm {
 
+torch::Tensor Executor::prepared_logits(const torch::Tensor& hidden_states,
+                                        const torch::Tensor& selected_idxes) {
+  return impl_->prepared_logits(hidden_states, selected_idxes);
+}
+
 Executor::Executor(CausalLM* model,
                    const ModelArgs& args,
                    const torch::Device& device,

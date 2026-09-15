@@ -204,3 +204,92 @@ def test_prepared_graph_activation_borrows_host_state_without_retaining_selectio
     assert backend._actual_seq_q is metadata.prepared_attention_state.actual_seq_q
     assert backend._actual_seq_kv is metadata.prepared_attention_state.actual_seq_kv
     assert backend._block_table_i32 is metadata.block_table
+
+
+def _mla_backend() -> NpuPagedAttentionBackend:
+    backend = NpuPagedAttentionBackend(
+        num_heads=64,
+        num_kv_heads=1,
+        head_dim=256,
+        scale=0.0625,
+        sliding_window=0,
+        is_mla=True,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    cache = torch.empty(4, 128, 1, 512)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    return backend
+
+
+def _mla_metadata(*, prefill: bool = False, chunked: bool = False) -> SimpleNamespace:
+    metadata = _ordinary_metadata(paged=True)
+    metadata.is_prefill = prefill
+    metadata.is_chunked_prefill = chunked
+    metadata.q_cu_seq_lens = torch.tensor([3, 5] if prefill or chunked else [1, 2], dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = [0, 3, 5] if prefill or chunked else [0, 1, 2]
+    metadata.slot_mapping = torch.arange(5 if prefill or chunked else 2, dtype=torch.int32)
+    return metadata
+
+
+@pytest.mark.parametrize(
+    "prefill,chunked,graph", [(True, False, False), (False, True, False), (False, False, False), (False, False, True)]
+)
+def test_prepared_mla_borrows_final_views_without_device_work(
+    prefill: bool,
+    chunked: bool,
+    graph: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _mla_backend()
+    active = object()
+    backend._metadata = active
+    metadata = _mla_metadata(prefill=prefill, chunked=chunked)
+    metadata.prepared_graph = object()
+    backend._mla_quant_indexer_metadata["previous_slot"] = object()
+
+    def reject_tensor_work(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("prepared MLA must borrow final views without Device work")
+
+    for name in ("cpu", "to", "copy_", "clone", "item"):
+        monkeypatch.setattr(torch.Tensor, name, reject_tensor_work)
+    for name in ("empty", "arange", "tensor"):
+        monkeypatch.setattr(torch, name, reject_tensor_work)
+    state = backend.prepare_metadata(metadata)
+    assert backend._metadata is active
+    assert "previous_slot" in backend._mla_quant_indexer_metadata
+    metadata.q_cu_seq_lens_host_values[:] = [-99]
+    metadata.kv_seq_lens_host_values[:] = [-99]
+    metadata.prepared_attention_state = state
+    backend.prepare(metadata, graph_mode=graph)
+    assert backend._metadata is state
+    assert not hasattr(state, "prepared_graph")
+    assert state.query_ends == ([3, 5] if prefill or chunked else [1, 2])
+    assert state.kv_lengths == [6, 4]
+    assert backend._mla_actual_seq_q is metadata.q_cu_seq_lens
+    assert backend._mla_actual_seq_kv is metadata.kv_seq_lens
+    assert backend._block_table_i32 is metadata.block_table
+    assert state.slot_mapping is metadata.slot_mapping
+    assert backend._mla_max_seqlen_q == (3 if prefill or chunked else 1)
+    assert backend._mla_max_seqlen_k == (128 if graph else 6)
+    assert not backend._mla_quant_indexer_metadata
+
+
+@pytest.mark.parametrize("invalid", ["table", "query_dtype", "kv_shape", "slots", "prefill_graph"])
+def test_prepared_mla_rejects_invalid_views_before_activation(invalid: str) -> None:
+    backend = _mla_backend()
+    metadata = _mla_metadata(prefill=invalid == "prefill_graph")
+    active = object()
+    backend._metadata = active
+    if invalid == "table":
+        metadata.block_table = None
+    elif invalid == "query_dtype":
+        metadata.q_cu_seq_lens = metadata.q_cu_seq_lens.to(torch.int64)
+    elif invalid == "kv_shape":
+        metadata.kv_seq_lens = metadata.kv_seq_lens[:1]
+    elif invalid == "slots":
+        metadata.slot_mapping = metadata.slot_mapping[:1]
+    with pytest.raises(ValueError):
+        metadata.prepared_attention_state = backend.prepare_metadata(metadata)
+        backend.prepare(metadata, graph_mode=True)
+    assert backend._metadata is active

@@ -177,12 +177,16 @@ class ModelExecutor:
         self.dp_size = dp_size
         self._supports_prepared_metadata = (
             self.attention_backend.supports_prepared_metadata
-            and config.get("model_type") == "qwen3"
-            and graph_backend in ("", "off", "none", "0", "aclgraph")
-            and all(
-                int(config.get(key, 1)) == 1
-                for key in ("tp_size", "dp_size", "cp_size", "ep_size", "moe_tp_size", "layerwise_split_size")
+            and (
+                config.get("model_type") == "glm_moe_dsa"
+                or (
+                    config.get("model_type") == "qwen3"
+                    and all(int(config.get(key, 1)) == 1 for key in ("tp_size", "ep_size", "moe_tp_size"))
+                )
             )
+            and int(config.get("kv_split_size", 1)) in (0, 1)
+            and graph_backend in ("", "off", "none", "0", "aclgraph")
+            and all(int(config.get(key, 1)) == 1 for key in ("dp_size", "cp_size", "layerwise_split_size"))
         )
         if dp_size > 1 and graph_backend not in (
             "",
@@ -284,7 +288,7 @@ class ModelExecutor:
         positions: torch.Tensor | None = None,
     ) -> None:
         if not self._supports_prepared_metadata or not self._kv_bound:
-            raise RuntimeError("prepared metadata requires an initialized single-rank Qwen3 executor")
+            raise RuntimeError("prepared metadata requires an initialized supported Qwen3 or GLM executor")
         metadata.prepared_attention_state = self.attention_backend.prepare_metadata(metadata)
         metadata.prepared_graph = None
         if self.decode_graph_runner is not None:

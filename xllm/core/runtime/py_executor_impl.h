@@ -55,6 +55,8 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
 
   std::vector<int64_t> prepared_graph_batch_sizes() override;
   void freeze_prepared_graphs() override;
+  torch::Tensor prepared_logits(const torch::Tensor& hidden_states,
+                                const torch::Tensor& selected_idxes) override;
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
                            std::vector<KVCache>& kv_caches,
