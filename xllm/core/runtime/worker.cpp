@@ -17,6 +17,7 @@ limitations under the License.
 #include "worker.h"
 
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
@@ -71,8 +72,18 @@ Worker::Worker(const ParallelArgs& parallel_args,
     CHECK(ModelConfig::is_python_model_impl(
         ModelConfig::get_instance().model_impl()))
         << "Task pipeline requires the Python model implementation.";
+    const auto& execution = ExecutionConfig::get_instance();
+    const std::string& graph_backend = execution.python_graph_backend();
+    CHECK(graph_backend.empty() || graph_backend == "off" ||
+          graph_backend == "none" || graph_backend == "0" ||
+          graph_backend == "aclgraph")
+        << "Task pipeline supports only the Python ACL graph backend.";
+    CHECK(graph_backend != "aclgraph" || options.enable_graph())
+        << "Task pipeline ACL graphs require enable_graph.";
+    CHECK(!options.enable_graph() || !execution.disable_graph_warmup())
+        << "Task pipeline ACL graphs require initialization warmup.";
     CHECK(worker_type == WorkerType::LLM && options.task_type() == "generate" &&
-          !options.enable_speculative_decode() && !options.enable_graph() &&
+          !options.enable_speculative_decode() &&
           !options.enable_prefill_piecewise_graph() &&
           !options.enable_disagg_pd() && options.host_blocks_factor() <= 1.0 &&
           !options.enable_kvcache_store() && !options.enable_sleep_mode() &&
@@ -82,7 +93,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !LoadConfig::get_instance().enable_rolling_load() &&
           parallel_args.world_size() == 1 && parallel_args.dp_size() == 1 &&
           parallel_args.cp_size() == 1 && parallel_args.ep_size() == 1)
-        << "Task pipeline currently requires single-rank ordinary eager LLM, "
+        << "Task pipeline currently requires single-rank ordinary Python LLM, "
            "without offload, disaggregation or sleep.";
   }
   if (options.enable_speculative_decode()) {
@@ -157,6 +168,19 @@ bool Worker::initialize_task_pipeline() {
 #endif
 }
 
+bool Worker::warmup_task_graphs() {
+#if defined(USE_NPU)
+  if (task_pipeline_) {
+    const Status status = task_pipeline_->warmup_graphs();
+    if (!status.ok()) {
+      LOG(ERROR) << status.message();
+      return false;
+    }
+  }
+#endif
+  return true;
+}
+
 bool Worker::init_model(const std::string& model_weights_path,
                         int32_t random_seed,
                         MasterStatus master_status) {
@@ -166,7 +190,7 @@ bool Worker::init_model(const std::string& model_weights_path,
 }
 
 bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
-  return impl_->allocate_kv_cache(kv_cache_shape);
+  return impl_->allocate_kv_cache(kv_cache_shape) && warmup_task_graphs();
 }
 
 bool Worker::set_speculative_validate_time_predictor(
@@ -288,7 +312,18 @@ folly::SemiFuture<bool> Worker::init_model_async(
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_async(
     const KVCacheShape& kv_cache_shape) {
-  return impl_->allocate_kv_cache_async(kv_cache_shape);
+  if (task_pipeline_slots_ == 0) {
+    return impl_->allocate_kv_cache_async(kv_cache_shape);
+  }
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, kv_cache_shape, promise = std::move(promise)]() mutable {
+        const bool allocated =
+            std::move(impl_->allocate_kv_cache_async(kv_cache_shape)).get();
+        promise.setValue(allocated && warmup_task_graphs());
+      });
+  return future;
 }
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_with_transfer_async(

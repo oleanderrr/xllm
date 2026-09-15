@@ -54,6 +54,21 @@ void TaskExecutionPipeline::check_external_thread() const {
   CHECK(std::this_thread::get_id() != launch_thread_.get_id());
 }
 
+Status TaskExecutionPipeline::warmup_graphs() {
+  check_external_thread();
+  folly::Promise<Status> promise;
+  auto future = promise.getFuture();
+  state_executor_.schedule([this, promise = std::move(promise)]() mutable {
+    if (next_task_id_ != 1) {
+      promise.setValue(Status(StatusCode::INVALID_ARGUMENT,
+                              "Graph warmup must precede Task admission."));
+      return;
+    }
+    promise.setValue(program_->warmup_graphs());
+  });
+  return std::move(future).get();
+}
+
 TaskSubmission TaskExecutionPipeline::submit(const LlmTaskInput& input) {
   check_external_thread();
   folly::Promise<TaskSubmission> promise;

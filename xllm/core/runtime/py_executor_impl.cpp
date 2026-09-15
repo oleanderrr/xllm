@@ -119,9 +119,16 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   ensure_xllm_runtime_module();
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
+  py::dict config = py_causal_lm_->config_dict();
+  if (options_.task_pipeline_slots() != 0) {
+    config = py::dict(config.attr("copy")());
+    config["enable_graph"] = options_.enable_graph();
+    config["python_graph_backend"] =
+        options_.enable_graph() ? "aclgraph" : "off";
+  }
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
-      py_causal_lm_->config_dict(),
+      config,
       options_.max_seqs_per_batch(),
       options_.num_decoding_tokens(),
       ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
@@ -170,23 +177,74 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
+    if (options_.task_pipeline_slots() != 0) {
+      prepared_kv_bindings_.reserve(2 * kv_caches.size());
+      for (const auto& kv : kv_caches) {
+        prepared_kv_bindings_.emplace_back(kv.get_k_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_v_cache());
+      }
+    }
   } else {
     CHECK_EQ(num_layers, kv_layer_count_)
         << "KV cache layer count changed after initial bind";
+    if (options_.task_pipeline_slots() != 0) {
+      size_t index = 0;
+      for (const auto& kv : kv_caches) {
+        for (const auto& current : {kv.get_k_cache(), kv.get_v_cache()}) {
+          const auto& bound = prepared_kv_bindings_[index++];
+          CHECK(current.data_ptr() == bound.data_ptr() &&
+                current.sizes() == bound.sizes() &&
+                current.strides() == bound.strides() &&
+                current.scalar_type() == bound.scalar_type() &&
+                current.device() == bound.device())
+              << "Prepared executor KV binding changed after initialization.";
+        }
+      }
+    }
   }
 }
 
-void PyExecutorImpl::prepare_attention_metadata(std::vector<KVCache>& kv_caches,
-                                                ModelInputParams& params) {
+void PyExecutorImpl::prepare_attention_metadata(
+    std::vector<KVCache>& kv_caches,
+    ModelInputParams& params,
+    const torch::Tensor& tokens,
+    const torch::Tensor& positions) {
   CHECK(supports_prepared_metadata_);
   CHECK(params.attn_metadata != nullptr);
   py::gil_scoped_acquire gil;
   bind_kv_caches(kv_caches);
   py::object metadata =
       py::cast(PyAttentionMetadataView(params.attn_metadata, params));
-  py_executor_.attr("prepare_metadata")(metadata);
+  py_executor_.attr("prepare_metadata")(
+      metadata, optional_tensor(tokens), optional_tensor(positions));
   params.python_attention_metadata =
       std::make_shared<PythonAttentionMetadata>(std::move(metadata));
+}
+
+std::vector<int64_t> PyExecutorImpl::prepared_graph_batch_sizes() {
+  py::gil_scoped_acquire gil;
+  return py_executor_.attr("prepared_graph_batch_sizes")()
+      .cast<std::vector<int64_t>>();
+}
+
+void PyExecutorImpl::freeze_prepared_graphs() {
+  py::gil_scoped_acquire gil;
+  py_executor_.attr("freeze_prepared_graphs")();
+}
+
+void PyExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
+                                         const torch::Tensor& positions,
+                                         std::vector<KVCache>& kv_caches,
+                                         const ModelInputParams& params) {
+  // The legacy Python runner keeps its original warmup entry point.
+  if (!params.python_attention_metadata) {
+    return;
+  }
+  py::gil_scoped_acquire gil;
+  bind_kv_caches(kv_caches);
+  active_py_causal_lm = py_causal_lm_;
+  py_executor_.attr("warmup_prepared_graph")(
+      tokens, positions, params.python_attention_metadata->value());
 }
 
 ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
@@ -194,7 +252,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                 std::vector<KVCache>& kv_caches,
                                 const ModelInputParams& params) {
   torch::NoGradGuard no_grad;
-  COUNTER_INC(num_model_execution_total_eager);
   active_py_causal_lm = py_causal_lm_;
 
   // Build or reuse attention metadata.
@@ -227,6 +284,20 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       params.python_attention_metadata
           ? params.python_attention_metadata->value()
           : py::cast(PyAttentionMetadataView(attn_metadata, params));
+  bool prepared_graph = false;
+  if (params.python_attention_metadata) {
+    const py::object selection = py_metadata.attr("prepared_graph");
+    prepared_graph = !selection.is_none() && !selection.attr("entry").is_none();
+    VLOG(1) << "Task pipeline model path="
+            << (prepared_graph ? "aclgraph" : "eager") << ", graph_miss_reason="
+            << (selection.is_none()
+                    ? "off"
+                    : selection.attr("miss_reason").cast<std::string>());
+  }
+  if (!prepared_graph) {
+    COUNTER_INC(num_model_execution_total_eager);
+  }
+
   py::object input_embedding =
       optional_tensor(params.embedding.input_embedding);
   py::object mtp_topk_indices = py::none();

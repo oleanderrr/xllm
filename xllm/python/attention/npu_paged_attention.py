@@ -303,12 +303,21 @@ class NpuPagedAttentionBackend(AttentionBackend):
     ) -> None:
         prepared = getattr(metadata, "prepared_attention_state", None)
         if prepared is not None:
-            if graph_mode or self._is_mla or not isinstance(prepared, _PreparedPagedAttention):
-                raise ValueError("prepared paged state requires ordinary eager attention")
-            self._metadata = metadata
+            if self._is_mla or not isinstance(prepared, _PreparedPagedAttention):
+                raise ValueError("prepared paged state requires ordinary attention")
+            if graph_mode:
+                batch_size = len(prepared.actual_seq_kv)
+                if metadata.is_prefill or metadata.is_chunked_prefill or self._graph_workspace is None:
+                    raise ValueError("prepared graph attention requires warmed decode buffers")
+                self._current_graph_output = self._graph_outputs[batch_size]
+                self._current_graph_lse = self._graph_lses[batch_size]
+            # A selected graph owns task-update closures that retain this
+            # backend. Replay needs only the fields below, so retaining the
+            # metadata (and its selected entry) would create an ownership cycle.
+            self._metadata = None if graph_mode else metadata
             self._use_expanded_decode = False
             self._block_table_i32 = prepared.block_table
-            self._actual_seq_lens = prepared.query_ends
+            self._actual_seq_lens = None if graph_mode else prepared.query_ends
             self._actual_seq_q = prepared.actual_seq_q
             self._actual_seq_kv = prepared.actual_seq_kv
             return

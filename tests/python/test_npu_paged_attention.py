@@ -175,3 +175,32 @@ def test_private_metadata_rejection_preserves_active_slot(invalid: str) -> None:
         backend.prepare_metadata(candidate)
     assert backend._metadata is active
     assert backend._actual_seq_kv is old_kv
+
+
+def test_prepared_graph_activation_borrows_host_state_without_retaining_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _ordinary_backend()
+    metadata = _ordinary_metadata(paged=True)
+    metadata.is_chunked_prefill = False
+    metadata.prepared_attention_state = backend.prepare_metadata(metadata)
+    metadata.prepared_graph = object()
+    output = torch.empty(2, 8, 64)
+    lse = torch.empty(0)
+    backend._graph_workspace = torch.empty(1)
+    backend._graph_outputs[2] = output
+    backend._graph_lses[2] = lse
+
+    def reject_tensor_work(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("prepared graph activation must reuse warmed storage and Host values")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", reject_tensor_work)
+    monkeypatch.setattr(torch.Tensor, "to", reject_tensor_work)
+    monkeypatch.setattr(torch, "empty", reject_tensor_work)
+    backend.prepare(metadata, graph_mode=True)
+    assert backend._metadata is None
+    assert backend._current_graph_output is output
+    assert backend._current_graph_lse is lse
+    assert backend._actual_seq_q is metadata.prepared_attention_state.actual_seq_q
+    assert backend._actual_seq_kv is metadata.prepared_attention_state.actual_seq_kv
+    assert backend._block_table_i32 is metadata.block_table

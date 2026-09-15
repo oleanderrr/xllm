@@ -78,6 +78,8 @@ class LlmTaskProgram final {
   LlmTaskProgram(const LlmTaskProgram&) = delete;
   LlmTaskProgram& operator=(const LlmTaskProgram&) = delete;
 
+  // Called once after final KV allocation and before the first admission.
+  Status warmup_graphs();
   Status prepare(uint32_t slot_id, const LlmTaskInput& input);
   void launch(uint32_t slot_id);
   LlmTaskOutput consume(uint32_t slot_id);
@@ -119,6 +121,8 @@ class LlmTaskProgram final {
   std::vector<KVCache>& kv_caches_;
   LlmTaskCapacity capacity_;
   torch::Device device_;
+  std::vector<int64_t> graph_batch_sizes_;
+  bool graphs_warmed_ = false;
   Stream prepare_stream_;
   Stream task_stream_;
   Stream result_stream_;

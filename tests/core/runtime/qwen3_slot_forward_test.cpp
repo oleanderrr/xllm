@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/runtime/executor.h"
+#include "core/runtime/py_attention_metadata.h"
 #include "core/runtime/task_pipeline/model_input_binding.h"
 #include "core/runtime/task_pipeline/task_execution_pipeline.h"
 #include "models/model_registry.h"
@@ -216,7 +217,21 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
                      {phase, static_cast<uint32_t>(actual), batch_id_++, false},
                      *prepare_)
             .ok());
-    slot_executor_->prepare_attention_metadata(prepared_kv_, binding.params());
+    slot_executor_->prepare_attention_metadata(
+        prepared_kv_, binding.params(), binding.tokens(), binding.positions());
+    if (graph_enabled_) {
+      pybind11::gil_scoped_acquire gil;
+      const auto selection =
+          binding.params().python_attention_metadata->value().attr(
+              "prepared_graph");
+      const bool graph_hit =
+          !phase.is_prefill() && !phase.is_chunked_prefill() &&
+          !phase.is_mixed() &&
+          std::find(graph_sizes_.begin(),
+                    graph_sizes_.end(),
+                    static_cast<int64_t>(batch.q.size())) != graph_sizes_.end();
+      EXPECT_EQ(!selection.attr("entry").is_none(), graph_hit);
+    }
     std::fill(batch.positions.begin(), batch.positions.end(), -99);
     const StreamEventPtr ready = prepare_->record_event();
     ASSERT_NE(ready, nullptr);
@@ -271,6 +286,19 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     }
   }
 
+  void enable_prepared_graph(int32_t max_sequences = 3) {
+    runtime::Options execution;
+    execution.max_seqs_per_batch(max_sequences);
+    execution.max_tokens_per_batch(32);
+    execution.enable_graph(true);
+    execution.task_pipeline_slots(2);
+    execution.enable_chunked_prefill(GetParam());
+    slot_executor_ =
+        std::make_unique<Executor>(model_.get(), args_, device_, execution);
+    graph_sizes_ = slot_executor_->prepared_graph_batch_sizes();
+    graph_enabled_ = true;
+  }
+
   std::unique_ptr<LlmTaskProgram> make_program(
       uint32_t slot_count = 1,
       torch::ScalarType parameter_dtype = torch::kBFloat16) {
@@ -293,6 +321,10 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
     EXPECT_TRUE(status.ok()) << status.message();
     if (!status.ok()) {
       return nullptr;
+    }
+    if (graph_enabled_) {
+      status = program->warmup_graphs();
+      EXPECT_TRUE(status.ok()) << status.message();
     }
     EXPECT_TRUE(torch::equal(rng_before, pipeline_rng_state()));
     return program;
@@ -443,6 +475,8 @@ class Qwen3SlotForwardTest : public ::testing::TestWithParam<bool> {
   bool old_chunked_ = false;
   bool old_graph_ = false;
   bool old_prefix_ = false;
+  bool graph_enabled_ = false;
+  std::vector<int64_t> graph_sizes_;
 };
 
 TEST_P(Qwen3SlotForwardTest, RealWeightsPrefillAndMultiStepDecode) {
@@ -1342,6 +1376,343 @@ TEST_P(Qwen3SlotForwardTest, PipelinePreservesShmSamplingPrecision) {
   }
   pipeline.reset();
   compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, AclGraphSequenceStateFeedsTwoSlots) {
+  for (torch::ScalarType parameter_dtype :
+       {torch::kBFloat16, torch::kFloat32}) {
+    SCOPED_TRACE(parameter_dtype);
+    enable_prepared_graph();
+    const auto reference = [&](const BatchData& batch,
+                               BatchForwardType phase,
+                               const SamplingParameters& params) {
+      return this->reference(batch, phase, params, parameter_dtype);
+    };
+
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, parameter_dtype, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    constexpr uint32_t kTasks = 9;
+    std::vector<BatchData> batches;
+    std::vector<SamplingParameters> parameters;
+    std::vector<SampleOutput> expected;
+    std::vector<std::array<SequenceStateKey, 2>> keys;
+    batches.reserve(kTasks);
+    parameters.reserve(kTasks);
+    expected.reserve(kTasks);
+    keys.reserve(kTasks);
+    const auto rng_before = pipeline_rng_state();
+    for (uint32_t step = 0; step < kTasks; ++step) {
+      const std::array<uint32_t, 2> order = step % 2 == 0
+                                                ? std::array<uint32_t, 2>{0, 1}
+                                                : std::array<uint32_t, 2>{1, 0};
+      const std::array<int32_t, 2> prompt{5, 3};
+      BatchData batch =
+          step == 0
+              ? make_batch(/*q=*/{5, 3}, /*kv=*/{5, 3})
+              : make_batch(
+                    /*q=*/{1, 1},
+                    /*kv=*/{prompt[order[0]] + static_cast<int32_t>(step),
+                            prompt[order[1]] + static_cast<int32_t>(step)});
+      if (step > 0) {
+        for (uint32_t row = 0; row < 2; ++row) {
+          batch.blocks[row] = static_cast<int32_t>(order[row]);
+          batch.slots[row] =
+              static_cast<int32_t>(128 * order[row]) + batch.positions[row];
+          // Every decode flips row order relative to its predecessor.
+          batch.tokens[row] = static_cast<int32_t>(
+              expected.back().next_tokens[1 - row].item<int64_t>());
+        }
+      }
+      auto params = sampling_for(batch, static_cast<int32_t>(step % 3));
+      auto result = reference(
+          batch,
+          step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE,
+          params);
+      batches.emplace_back(std::move(batch));
+      parameters.emplace_back(std::move(params));
+      expected.emplace_back(std::move(result));
+      keys.emplace_back(
+          std::array<SequenceStateKey, 2>{SequenceStateKey{101 + order[0], 0},
+                                          SequenceStateKey{101 + order[1], 0}});
+    }
+    const auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng_before);
+    std::vector<uint64_t> tickets;
+    std::vector<TokenResultTensors> retained;
+    std::vector<torch::Tensor> snapshots;
+    tickets.reserve(kTasks);
+    retained.reserve(kTasks);
+    snapshots.reserve(kTasks);
+    const auto submit = [&](uint32_t step) {
+      if (step > 0) {
+        // These values carry no row index: identity and position authorize
+        // reads.
+        batches[step].tokens = step % 2 == 0 ? std::vector<int32_t>{-1, -1}
+                                             : std::vector<int32_t>{-7, -901};
+      }
+      const auto accepted = pipeline->submit(
+          {view(batches[step]),
+           {step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE,
+            2},
+           parameters[step],
+           keys[step],
+           {}});
+      EXPECT_TRUE(accepted.status.ok()) << accepted.status.message();
+      tickets.emplace_back(accepted.task_id);
+      // PrepareAck released every caller borrow, including identity and
+      // sampling.
+      batches[step].tokens.assign(batches[step].tokens.size(), -999);
+      parameters[step].top_p.zero_();
+      keys[step] = {};
+    };
+    submit(/*step=*/0);
+    submit(/*step=*/1);
+    for (uint32_t step = 0; step < kTasks; ++step) {
+      auto actual = pipeline->take_result_async().get();
+      ASSERT_EQ(actual.task_id, tickets[step]);
+      compare_result(actual, expected[step]);
+      snapshots.emplace_back(actual.output.tokens.tokens.clone());
+      retained.emplace_back(std::move(actual.output.tokens));
+      if (step + 2 < kTasks) {
+        submit(step + 2);
+      }
+    }
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    const std::array<SequenceStateKey, 2> retired{{{101, 0}, {102, 0}}};
+    BatchData empty;
+    const auto control = pipeline->submit(
+        {view(empty), {BatchForwardType::EMPTY, 0}, {}, {}, retired});
+    ASSERT_TRUE(control.status.ok());
+    auto control_result = pipeline->take_result_async(control.task_id).get();
+    EXPECT_TRUE(control_result.status.ok());
+    EXPECT_FALSE(control_result.output.tokens.tokens.defined());
+    pipeline.reset();
+    for (uint32_t index = 0; index < retained.size(); ++index) {
+      EXPECT_TRUE(torch::equal(retained[index].tokens, snapshots[index]));
+    }
+    compare_kv();
+  }
+}
+
+TEST_P(Qwen3SlotForwardTest, AclGraphSingleSlotSamplingAndInputOwnership) {
+  enable_prepared_graph();
+  ThreadPool state(/*num_threads=*/1);
+  auto pipeline = make_pipeline(state);
+  ASSERT_NE(pipeline, nullptr);
+  std::vector<TokenResultTensors> retained;
+  std::vector<torch::Tensor> snapshots;
+  retained.reserve(/*new_cap=*/9);
+  snapshots.reserve(/*new_cap=*/9);
+  for (int32_t step = 0; step < 9; ++step) {
+    auto batch = step == 0 ? make_batch({5, 3}, {5, 3})
+                           : make_batch({1, 1}, {5 + step, 3 + step});
+    const BatchForwardType phase =
+        step == 0 ? BatchForwardType::PREFILL : BatchForwardType::DECODE;
+    if (step != 0) {
+      const int64_t* previous = retained.back().tokens.data_ptr<int64_t>();
+      batch.tokens[0] = static_cast<int32_t>(previous[0]);
+      batch.tokens[1] = static_cast<int32_t>(previous[1]);
+    }
+    auto params = sampling_for(batch, step % 3);
+    SCOPED_TRACE(step);
+    auto rng_before = pipeline_rng_state();
+    auto expected = reference(batch, phase, params);
+    auto expected_rng = pipeline_rng_state();
+    ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+    restore_pipeline_rng(rng_before);
+    const auto submitted = pipeline->submit({view(batch), {phase, 2}, params});
+    ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+    EXPECT_EQ(pipeline->submit({view(batch), {phase, 2}, params}).status.code(),
+              StatusCode::RESOURCE_EXHAUSTED);
+    std::fill(batch.tokens.begin(), batch.tokens.end(), -99);
+    std::fill(batch.positions.begin(), batch.positions.end(), -99);
+    params.selected_token_idxes.fill_(/*value=*/-99);
+    params.top_p.fill_(/*value=*/0);
+    params.unique_token_counts.fill_(/*value=*/99);
+    params.do_sample.logical_not_();
+    auto result = pipeline->take_result_async(submitted.task_id).get();
+    compare_result(result, expected);
+    EXPECT_TRUE(torch::equal(pipeline_rng_state(), expected_rng));
+    EXPECT_EQ(
+        pipeline->take_result_async(submitted.task_id).get().status.code(),
+        StatusCode::INVALID_ARGUMENT);
+    snapshots.emplace_back(result.output.tokens.tokens.clone());
+    retained.emplace_back(std::move(result.output.tokens));
+  }
+  pipeline.reset();
+  for (uint32_t index = 0; index < retained.size(); ++index) {
+    EXPECT_TRUE(torch::equal(retained[index].tokens, snapshots[index]));
+  }
+  compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, AclGraphBindingsMatchEagerAcrossMisses) {
+  enable_prepared_graph();
+  for (uint32_t slot = 0; slot < bindings_.size(); ++slot) {
+    for (int32_t rows : {2, 1}) {
+      auto batch = make_batch(std::vector<int32_t>(rows, 1),
+                              std::vector<int32_t>(rows, 1));
+      std::fill(batch.slots.begin(), batch.slots.end(), -1);
+      auto& binding = *bindings_[slot];
+      ASSERT_TRUE(binding
+                      .prepare(view(batch),
+                               {BatchForwardType::DECODE,
+                                static_cast<uint32_t>(rows),
+                                0,
+                                true},
+                               *prepare_)
+                      .ok());
+      ASSERT_EQ(prepare_->synchronize(), 0);
+      slot_executor_->prepare_attention_metadata(prepared_kv_,
+                                                 binding.params(),
+                                                 binding.tokens(),
+                                                 binding.positions());
+      auto guard = launch_->set_stream_guard();
+      slot_executor_->prepare_graph_input(binding.tokens(),
+                                          binding.positions(),
+                                          prepared_kv_,
+                                          binding.params());
+    }
+  }
+  slot_executor_->freeze_prepared_graphs();
+  compare_kv();
+  compare(make_batch({5, 3, 4}, {5, 3, 4}), BatchForwardType::PREFILL, 0);
+  std::array<int32_t, 3> lengths{5, 3, 4};
+  if (GetParam()) {
+    compare(make_batch({2, 1, 1}, {7, 4, 5}), BatchForwardType::MIXED, 1);
+    lengths = {7, 4, 5};
+  }
+  for (uint32_t step = 0; step < 9; ++step) {
+    const uint32_t rows = 1 + step % 3;
+    std::vector<int32_t> kv;
+    kv.reserve(rows);
+    for (uint32_t row = 0; row < rows; ++row) {
+      kv.emplace_back(++lengths[row]);
+    }
+    compare(make_batch(std::vector<int32_t>(rows, 1), std::move(kv)),
+            BatchForwardType::DECODE,
+            step % 2);
+  }
+  compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, AclGraphAllConfiguredBuckets) {
+  enable_prepared_graph(/*max_sequences=*/16);
+  KVCacheCapacity capacity;
+  capacity.n_blocks(17);
+  capacity.block_size(128);
+  const KVCacheShape shape(capacity, args_, /*world_size=*/1);
+  KVCacheCreateOptions cache_options;
+  cache_options.device(device_);
+  cache_options.dtype(torch::kBFloat16);
+  cache_options.num_layers(args_.n_layers());
+  cache_options.model_type(args_.model_type());
+  eager_kv_.clear();
+  prepared_kv_.clear();
+  for (int32_t layer = 0; layer < args_.n_layers(); ++layer) {
+    eager_kv_.emplace_back(shape, cache_options, layer);
+    prepared_kv_.emplace_back(shape, cache_options, layer);
+    eager_kv_.back().get_k_cache().zero_();
+    eager_kv_.back().get_v_cache().zero_();
+    prepared_kv_.back().get_k_cache().zero_();
+    prepared_kv_.back().get_v_cache().zero_();
+  }
+  ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+  for (uint32_t slot = 0; slot < bindings_.size(); ++slot) {
+    bindings_[slot].reset();
+    storage_[slot].reset();
+    ASSERT_TRUE(
+        ModelInputStorage::create({32, 16, 2}, device_, storage_[slot]).ok());
+    bindings_[slot] = std::make_unique<ModelInputBinding>(*storage_[slot]);
+    for (int64_t rows : graph_sizes_) {
+      auto batch = make_batch(std::vector<int32_t>(rows, /*value=*/1),
+                              std::vector<int32_t>(rows, /*value=*/1));
+      std::fill(batch.slots.begin(), batch.slots.end(), /*value=*/-1);
+      auto& binding = *bindings_[slot];
+      ASSERT_TRUE(binding
+                      .prepare(view(batch),
+                               {BatchForwardType::DECODE,
+                                static_cast<uint32_t>(rows),
+                                0,
+                                true},
+                               *prepare_)
+                      .ok());
+      ASSERT_EQ(prepare_->synchronize(), 0);
+      slot_executor_->prepare_attention_metadata(prepared_kv_,
+                                                 binding.params(),
+                                                 binding.tokens(),
+                                                 binding.positions());
+      auto guard = launch_->set_stream_guard();
+      slot_executor_->prepare_graph_input(binding.tokens(),
+                                          binding.positions(),
+                                          prepared_kv_,
+                                          binding.params());
+    }
+  }
+  slot_executor_->freeze_prepared_graphs();
+  compare_kv();
+  compare(make_batch(std::vector<int32_t>(16, /*value=*/1),
+                     std::vector<int32_t>(16, /*value=*/1)),
+          BatchForwardType::PREFILL,
+          /*slot=*/0);
+  std::vector<int32_t> lengths(16, /*value=*/1);
+  uint32_t step = 0;
+  for (int32_t round = 0; round < 2; ++round) {
+    for (uint32_t rows : {16U, 8U, 4U, 2U, 1U, 3U}) {
+      std::vector<int32_t> kv;
+      kv.reserve(rows);
+      for (uint32_t row = 0; row < rows; ++row) {
+        kv.emplace_back(++lengths[row]);
+      }
+      compare(
+          make_batch(std::vector<int32_t>(rows, /*value=*/1), std::move(kv)),
+          BatchForwardType::DECODE,
+          step++ % 2);
+    }
+  }
+  compare_kv();
+}
+
+TEST_P(Qwen3SlotForwardTest, AclGraphDrainsUnclaimedOutputs) {
+  for (int32_t pending = 0; pending <= 2; ++pending) {
+    SCOPED_TRACE(pending);
+    enable_prepared_graph();
+    ThreadPool state(/*num_threads=*/1);
+    auto pipeline = make_pipeline(state, torch::kBFloat16, /*slot_count=*/2);
+    ASSERT_NE(pipeline, nullptr);
+    EXPECT_EQ(pipeline->warmup_graphs().code(), StatusCode::INVALID_ARGUMENT);
+    auto first = make_batch({5, 3}, {5, 3});
+    auto second = make_batch({1, 1}, {6, 4});
+    auto first_params = sampling_for(first, /*mode=*/1);
+    auto second_params = sampling_for(second, /*mode=*/2);
+    const auto rng = pipeline_rng_state();
+    if (pending >= 1) {
+      reference(first, BatchForwardType::PREFILL, first_params);
+    }
+    if (pending == 2) {
+      reference(second, BatchForwardType::DECODE, second_params);
+    }
+    const auto expected_rng = pipeline_rng_state();
+    restore_pipeline_rng(rng);
+    if (pending >= 1) {
+      ASSERT_TRUE(
+          pipeline
+              ->submit(
+                  {view(first), {BatchForwardType::PREFILL, 2}, first_params})
+              .status.ok());
+    }
+    if (pending == 2) {
+      ASSERT_TRUE(
+          pipeline
+              ->submit(
+                  {view(second), {BatchForwardType::DECODE, 2}, second_params})
+              .status.ok());
+    }
+    pipeline.reset();
+    EXPECT_TRUE(torch::equal(expected_rng, pipeline_rng_state()));
+    compare_kv();
+  }
 }
 
 TEST_P(Qwen3SlotForwardTest, PipelineClosedLoopPerformance) {

@@ -53,6 +53,7 @@ from xllm.python.model_executor.runners.base import BaseRunner
 from xllm.python.model_executor.runners.decode_cuda_graph import (
     _CAPTURE_WARMUP_STEPS,
     _decode_bucket,
+    _decode_graph_buckets,
 )
 
 
@@ -111,6 +112,15 @@ _GraphKey = tuple[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedAclGraphSelection:
+    """Prepare-time selection; an expected miss executes the prepared eager path."""
+
+    entry: _DecodeGraphEntry | None
+    binding: tuple[object, ...]
+    miss_reason: str = ""
+
+
 class DecodeAclGraphRunner(BaseRunner):
     """Decode graph runner for NPU (Ascend) using ACL graph capture/replay."""
 
@@ -135,11 +145,163 @@ class DecodeAclGraphRunner(BaseRunner):
         self.num_decoding_tokens = max(1, int(num_decoding_tokens))
         self._batch_limit_warning_logged = False
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
+        # The runner instance fixes the model, weights and attention configuration.
+        # Each key additionally identifies a Slot's final tensor views. Cache
+        # membership is frozen before admission; no serving call can capture.
+        self._prepared_graphs: dict[tuple[object, ...], _DecodeGraphEntry] = {}
+        self._prepared_frozen = False
+        self._prepared_memory_before: tuple[int, int] | None = None
+        self.prepared_replays = 0
+        self.prepared_misses: dict[str, int] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+
+    def prepared_batch_sizes(self) -> list[int]:
+        """Exact buckets avoid introducing dummy model or sampling rows."""
+        if self.dp_size != 1 or self.num_decoding_tokens != 1:
+            raise ValueError("prepared ACL graphs require ordinary single-rank decode")
+        return list(reversed(_decode_graph_buckets(self.max_batch, 1)))
+
+    @staticmethod
+    def _prepared_binding(
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> tuple[object, ...]:
+        tensors = (
+            input_ids,
+            positions,
+            metadata.slot_mapping,
+            metadata.block_table,
+            metadata.q_seq_lens,
+            metadata.kv_seq_lens,
+        )
+        return tuple(
+            None
+            if tensor is None
+            else (
+                tensor.data_ptr(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.dtype,
+                tensor.device,
+            )
+            for tensor in tensors
+        )
+
+    def select_prepared(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> PreparedAclGraphSelection:
+        binding = self._prepared_binding(input_ids, positions, metadata)
+        if metadata.is_prefill or metadata.is_chunked_prefill:
+            reason = "prefill"
+        elif not self._prepared_frozen:
+            reason = "not_warmed"
+        elif input_ids.numel() not in self.prepared_batch_sizes():
+            reason = "shape_not_captured"
+        else:
+            entry = self._prepared_graphs.get(binding)
+            if entry is not None:
+                return PreparedAclGraphSelection(entry, binding)
+            reason = "binding_not_captured"
+        self.prepared_misses[reason] = self.prepared_misses.get(reason, 0) + 1
+        return PreparedAclGraphSelection(None, binding, reason)
+
+    @torch.inference_mode()
+    def warmup_prepared(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> None:
+        if self._prepared_frozen:
+            raise RuntimeError("prepared ACL graph cache is frozen")
+        batch_size = input_ids.numel()
+        if batch_size not in self.prepared_batch_sizes():
+            raise ValueError("unplanned prepared ACL graph bucket")
+        if metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_spec_verify:
+            raise ValueError("prepared ACL graph capture requires ordinary decode")
+        if getattr(metadata, "prepared_attention_state", None) is None:
+            raise ValueError("prepared ACL graph capture requires prepared metadata")
+        self._validate_decode_token_layout(input_ids, positions, metadata.slot_mapping, batch_size)
+        binding = self._prepared_binding(input_ids, positions, metadata)
+        if binding in self._prepared_graphs:
+            return
+        if self._prepared_memory_before is None:
+            self._prepared_memory_before = (
+                torch.npu.memory_allocated(self.device),
+                torch.npu.memory_reserved(self.device),
+            )
+        if self._update_stream is None:
+            self._update_stream = torch.npu.Stream(device=self.device, priority=-1)
+            self._replay_done_event = torch.npu.Event()
+        entry = _DecodeGraphEntry()
+        entry.batch_size = batch_size
+        entry.graph = None
+        entry.static_output = None
+        entry.static_input_ids = input_ids
+        entry.static_positions = positions
+        entry.static_input_embedding = None
+        entry.graph_tasks = []
+        entry.execution_state = AclGraphExecutionState({})
+        # Retain the exact views independently of the mutable native Slot
+        # metadata. Only the original model's inputs are captured here.
+        entry.static_metadata = _StaticAttentionMetadata(
+            slot_mapping=metadata.slot_mapping,
+            paged_kv_indptr=metadata.paged_kv_indptr,
+            paged_kv_indices=metadata.paged_kv_indices,
+            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+            block_table=metadata.block_table,
+            q_seq_lens=metadata.q_seq_lens,
+            q_cu_seq_lens=metadata.q_cu_seq_lens,
+            kv_seq_lens=metadata.kv_seq_lens,
+            kv_seq_lens_host_values=list(metadata.kv_seq_lens_host_values),
+        )
+        self.attention_backend.prepare(entry.static_metadata, graph_mode=True)
+        self._capture(entry, torch.npu.current_stream(self.device))
+        self._prepared_graphs[binding] = entry
+
+    def freeze_prepared(self) -> None:
+        if self._prepared_frozen:
+            raise RuntimeError("prepared ACL graph cache was already frozen")
+        self._prepared_frozen = True
+        before = self._prepared_memory_before
+        allocated = 0 if before is None else torch.npu.memory_allocated(self.device) - before[0]
+        reserved = 0 if before is None else torch.npu.memory_reserved(self.device) - before[1]
+        logger.info(
+            f"Prepared ACL graphs frozen: bindings={len(self._prepared_graphs)}, "
+            f"allocated_bytes={allocated}, reserved_bytes={reserved}"
+        )
+
+    def execute_prepared(
+        self,
+        selection: PreparedAclGraphSelection,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        entry = selection.entry
+        if not self._prepared_frozen or entry is None:
+            raise RuntimeError("prepared ACL replay requires a frozen selected binding")
+        if selection.binding != self._prepared_binding(input_ids, positions, metadata):
+            raise RuntimeError("prepared ACL graph input binding changed after Prepare")
+        # Only serialized Launch installs shared backend state. This path
+        # selects already allocated attention buffers and borrows Host lists.
+        self.attention_backend.prepare(metadata, graph_mode=True)
+        stream = torch.npu.current_stream(self.device)
+        entry.graph.replay()
+        with torch.npu.stream(self._update_stream):
+            self._update_stream.wait_event(self._replay_done_event)
+            self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+        self._replay_done_event.record(stream)
+        self.prepared_replays += 1
+        return entry.static_output
 
     def can_execute(
         self,
@@ -849,7 +1011,12 @@ class DecodeAclGraphRunner(BaseRunner):
         if padded_batch_size > batch_size:
             static_kv_seq_lens[batch_size:] = [1] * (padded_batch_size - batch_size)
 
-    def _capture(self, entry: _DecodeGraphEntry) -> None:
+    def _capture(
+        self,
+        entry: _DecodeGraphEntry,
+        stream: torch.npu.Stream | None = None,
+    ) -> None:
+        stream = self._stream if stream is None else stream
         context = ForwardContext(
             self.attention_backend,
             self.device,
@@ -857,12 +1024,12 @@ class DecodeAclGraphRunner(BaseRunner):
             self.layer_caches,
             execution_state=entry.execution_state,
         )
-        with forward_context(context), torch.npu.stream(self._stream):
+        with forward_context(context), torch.npu.stream(stream):
             for _ in range(_CAPTURE_WARMUP_STEPS):
                 self._forward_static(entry)
         torch.npu.synchronize()
         entry.graph = torch.npu.NPUGraph()
-        capture_context = AclGraphCaptureContext(self._stream, [])
+        capture_context = AclGraphCaptureContext(stream, [])
         context = ForwardContext(
             self.attention_backend,
             self.device,
@@ -871,7 +1038,7 @@ class DecodeAclGraphRunner(BaseRunner):
             acl_graph=capture_context,
             execution_state=entry.execution_state,
         )
-        with forward_context(context), torch.npu.graph(entry.graph, stream=self._stream):
+        with forward_context(context), torch.npu.graph(entry.graph, stream=stream):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
 

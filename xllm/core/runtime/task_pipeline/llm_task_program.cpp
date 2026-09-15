@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 
 namespace xllm {
 namespace {
@@ -104,6 +105,14 @@ Status LlmTaskProgram::create(CausalLM& model,
                                 program->sequence_state_pool_);
   if (!pool_status.ok()) {
     return pool_status;
+  }
+  const auto graph_batch_sizes = executor.prepared_graph_batch_sizes();
+  program->graph_batch_sizes_.reserve(graph_batch_sizes.size());
+  for (int64_t size : graph_batch_sizes) {
+    if (size <= capacity.model.max_sequences &&
+        size <= capacity.model.max_tokens) {
+      program->graph_batch_sizes_.emplace_back(size);
+    }
   }
   const uint32_t rows = capacity.model.max_sequences;
   program->slots_.reserve(capacity.slot_count);
@@ -242,7 +251,55 @@ Status LlmTaskProgram::validate(const Slot& slot,
   return Status();
 }
 
+Status LlmTaskProgram::warmup_graphs() {
+  if (graphs_warmed_) {
+    return invalid("Task graphs were already initialized.");
+  }
+  if (!graph_batch_sizes_.empty() &&
+      (kv_caches_.empty() || kv_caches_.front().empty())) {
+    return Status(StatusCode::UNAVAILABLE,
+                  "Task graph warmup requires final KV allocation.");
+  }
+  c10::DeviceGuard device_guard(device_);
+  auto guard = task_stream_.set_stream_guard();
+  // Largest first sizes the shared attention workspace before smaller graphs.
+  for (auto& slot : slots_) {
+    for (int64_t size : graph_batch_sizes_) {
+      std::vector<int32_t> zeros(size, /*value=*/0);
+      std::vector<int32_t> ones(size, /*value=*/1);
+      std::vector<int32_t> slots(size, /*value=*/-1);
+      std::vector<int32_t> ends(size);
+      std::iota(ends.begin(), ends.end(), /*value=*/1);
+      const ModelInputHostView input{
+          zeros, zeros, slots, ones, ones, ends, zeros, 1};
+      const ModelInputBatch batch{
+          BatchForwardType::DECODE, static_cast<uint32_t>(size), 0, true};
+      const Status status =
+          slot->model_input->prepare(input, batch, prepare_stream_);
+      CHECK(status.ok()) << status.message();
+      CHECK_EQ(prepare_stream_.synchronize(), 0);
+      executor_.prepare_attention_metadata(kv_caches_,
+                                           slot->model_input->params(),
+                                           slot->model_input->tokens(),
+                                           slot->model_input->positions());
+      // Negative cache slots keep capture warmup from changing live KV.
+      executor_.prepare_graph_input(slot->model_input->tokens(),
+                                    slot->model_input->positions(),
+                                    kv_caches_,
+                                    slot->model_input->params());
+    }
+  }
+  CHECK_EQ(task_stream_.synchronize(), 0);
+  executor_.freeze_prepared_graphs();
+  graphs_warmed_ = true;
+  return Status();
+}
+
 Status LlmTaskProgram::prepare(uint32_t slot_id, const LlmTaskInput& input) {
+  if (!graph_batch_sizes_.empty() && !graphs_warmed_) {
+    return Status(StatusCode::UNAVAILABLE,
+                  "Task graphs must be warmed before admission.");
+  }
   if (slot_id >= slots_.size()) {
     return invalid("Invalid LLM Slot index.");
   }
@@ -268,7 +325,9 @@ Status LlmTaskProgram::prepare(uint32_t slot_id, const LlmTaskInput& input) {
   CHECK(status.ok()) << status.message();
   if (!input.model.token_ids.empty()) {
     executor_.prepare_attention_metadata(kv_caches_,
-                                         slot.model_input->params());
+                                         slot.model_input->params(),
+                                         slot.model_input->tokens(),
+                                         slot.model_input->positions());
   }
   const auto& params = slot.sampling_input->params();
   const uint32_t samples =

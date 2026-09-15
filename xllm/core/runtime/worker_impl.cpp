@@ -1949,8 +1949,13 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
   capacity.hidden_size = static_cast<uint32_t>(args.hidden_size());
   // Ordinary SHM materializes builder FP32 sampling tensors before Worker
   // prepare, while RPC normalizes them to the model dtype. Preserve both
-  // existing contracts when staging directly into the Slot.
-  capacity.parameter_dtype = options_.enable_shm() ? torch::kFloat32 : dtype_;
+  // existing contracts when staging directly into the Slot. Overlapped
+  // Graph SHM already defers normalization to Worker prepare in Legacy.
+  const bool deferred_graph_sampling =
+      options_.enable_graph() && options_.enable_schedule_overlap();
+  capacity.parameter_dtype = options_.enable_shm() && !deferred_graph_sampling
+                                 ? torch::kFloat32
+                                 : dtype_;
   capacity.chunked_prefill = options_.enable_chunked_prefill();
   std::unique_ptr<LlmTaskProgram> program;
   ::xllm::Status status = LlmTaskProgram::create(

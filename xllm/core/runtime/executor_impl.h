@@ -50,9 +50,14 @@ class ExecutorImpl {
 
   virtual bool supports_prepared_attention_metadata() const { return false; }
   virtual void prepare_attention_metadata(std::vector<KVCache>& /*kv_caches*/,
-                                          ModelInputParams& /*params*/) {
+                                          ModelInputParams& /*params*/,
+                                          const torch::Tensor& /*tokens*/,
+                                          const torch::Tensor& /*positions*/) {
     LOG(FATAL) << "Executor does not support prepared attention metadata.";
   }
+
+  virtual std::vector<int64_t> prepared_graph_batch_sizes() { return {}; }
+  virtual void freeze_prepared_graphs() {}
 
   // tokens: vector size is dp_size, each element is [num_tokens/dp_size]
   // positions: vector size is dp_size, each element is [num_tokens/dp_size]

@@ -145,6 +145,7 @@ class Worker {
 
  private:
   bool initialize_task_pipeline();
+  bool warmup_task_graphs();
   int32_t task_pipeline_slots_ = 0;
   WorkerImpl* impl_ = nullptr;
 #if defined(USE_NPU)

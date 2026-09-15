@@ -51,9 +51,17 @@ bool Executor::supports_prepared_attention_metadata() const {
 }
 
 void Executor::prepare_attention_metadata(std::vector<KVCache>& kv_caches,
-                                          ModelInputParams& params) {
-  impl_->prepare_attention_metadata(kv_caches, params);
+                                          ModelInputParams& params,
+                                          const torch::Tensor& tokens,
+                                          const torch::Tensor& positions) {
+  impl_->prepare_attention_metadata(kv_caches, params, tokens, positions);
 }
+
+std::vector<int64_t> Executor::prepared_graph_batch_sizes() {
+  return impl_->prepared_graph_batch_sizes();
+}
+
+void Executor::freeze_prepared_graphs() { impl_->freeze_prepared_graphs(); }
 
 ModelOutput Executor::forward(const torch::Tensor& tokens,
                               const torch::Tensor& positions,

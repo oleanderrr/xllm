@@ -70,6 +70,9 @@ void register_attention_metadata_views(py::module_& module) {
           &PyExpandedDecodeMetadataView::kv_seq_lens_host_values);
 
   py::class_<PyAttentionMetadataView>(module, "AttentionMetadataView")
+      .def_property("prepared_graph",
+                    &PyAttentionMetadataView::prepared_graph,
+                    &PyAttentionMetadataView::set_prepared_graph)
       .def_property("prepared_attention_state",
                     &PyAttentionMetadataView::prepared_attention_state,
                     &PyAttentionMetadataView::set_prepared_attention_state)
@@ -350,6 +353,23 @@ int64_t PyAttentionMetadataView::max_query_len() const {
 
 int64_t PyAttentionMetadataView::max_seq_len() const {
   return metadata_->max_seq_len;
+}
+
+py::object PyAttentionMetadataView::prepared_graph() const {
+  if (!prepared_graph_holder_) {
+    return py::none();
+  }
+  return std::static_pointer_cast<PythonObjectHolder>(prepared_graph_holder_)
+      ->value;
+}
+
+void PyAttentionMetadataView::set_prepared_graph(py::object value) {
+  if (value.is_none()) {
+    prepared_graph_holder_.reset();
+    return;
+  }
+  prepared_graph_holder_ =
+      std::make_shared<PythonObjectHolder>(std::move(value));
 }
 
 py::object PyAttentionMetadataView::prepared_attention_state() const {

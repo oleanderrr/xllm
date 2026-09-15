@@ -37,9 +37,10 @@ struct TaskResult {
   uint64_t task_id = 0;
 };
 
-// One or two eager Slots. The owner prevents external calls racing with
-// destruction. State executor, model and KV all outlive this pipeline.
-// Public calls/destruction must occur outside its state/Launch threads.
+// One or two Slots with prepared Eager/Graph execution. The owner prevents
+// external calls racing with destruction. State executor, model and KV all
+// outlive this pipeline. Public calls/destruction must occur outside its
+// state/Launch threads.
 class TaskExecutionPipeline final {
  public:
   static Status create(ThreadPool& state_executor,
@@ -48,6 +49,9 @@ class TaskExecutionPipeline final {
   ~TaskExecutionPipeline();
   TaskExecutionPipeline(const TaskExecutionPipeline&) = delete;
   TaskExecutionPipeline& operator=(const TaskExecutionPipeline&) = delete;
+
+  // Initialization only, after final KV allocation and before submit.
+  Status warmup_graphs();
 
   // Waits for Prepare Ack only. On success no caller input storage is still
   // borrowed. Backpressure and validation return before accepting a Task.

@@ -134,8 +134,8 @@ Status make_llm_task_input(const ForwardInput& source, LlmTaskInput& output) {
   // BatchInputBuilder leaves actual_num_sequences unset before Worker prepare.
   // ProfileManager also marks ordinary eager warmup as is_graph_warmup.
   // It is an output-metrics marker here, not permission for graph execution.
-  // The Slot preserves it in the detached response; this invocation stays
-  // eager.
+  // The Slot preserves it in the detached response. Graph capture is
+  // completed separately during initialization, before Task admission.
   LlmTaskInput input;
   input.batch = {meta.batch_forward_type,
                  static_cast<uint32_t>(rows),

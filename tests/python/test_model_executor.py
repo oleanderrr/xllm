@@ -1336,7 +1336,7 @@ def test_executor_rejects_unsupported_prepared_metadata(unsupported: dict[str, o
         executor = ModelExecutor(_FakeModel(), {"model_type": "qwen3", **unsupported}, max_seqs_per_batch=2)
     assert not executor.supports_prepared_metadata
     metadata = SimpleNamespace(q_cu_seq_lens_host_values=[1, 2])
-    with pytest.raises(RuntimeError, match="single-rank eager Qwen3"):
+    with pytest.raises(RuntimeError, match="single-rank Qwen3"):
         executor.prepare_metadata(metadata)
     assert not hasattr(metadata, "prepared_attention_state")
     assert not backend._prepared

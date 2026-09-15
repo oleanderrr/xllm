@@ -49,7 +49,16 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
     return supports_prepared_metadata_;
   }
   void prepare_attention_metadata(std::vector<KVCache>& kv_caches,
-                                  ModelInputParams& params) override;
+                                  ModelInputParams& params,
+                                  const torch::Tensor& tokens = {},
+                                  const torch::Tensor& positions = {}) override;
+
+  std::vector<int64_t> prepared_graph_batch_sizes() override;
+  void freeze_prepared_graphs() override;
+  void prepare_graph_input(const torch::Tensor& tokens,
+                           const torch::Tensor& positions,
+                           std::vector<KVCache>& kv_caches,
+                           const ModelInputParams& params) override;
 
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
@@ -70,6 +79,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   bool supports_prepared_metadata_ = false;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;
+  std::vector<torch::Tensor> prepared_kv_bindings_;
 };
 
 REGISTER_EXECUTOR("python", PyExecutorImpl);

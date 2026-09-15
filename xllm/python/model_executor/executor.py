@@ -178,7 +178,7 @@ class ModelExecutor:
         self._supports_prepared_metadata = (
             self.attention_backend.supports_prepared_metadata
             and config.get("model_type") == "qwen3"
-            and graph_backend in ("", "off", "none", "0")
+            and graph_backend in ("", "off", "none", "0", "aclgraph")
             and all(
                 int(config.get(key, 1)) == 1
                 for key in ("tp_size", "dp_size", "cp_size", "ep_size", "moe_tp_size", "layerwise_split_size")
@@ -277,10 +277,39 @@ class ModelExecutor:
     def supports_prepared_metadata(self) -> bool:
         return self._supports_prepared_metadata
 
-    def prepare_metadata(self, metadata: AttentionMetadata) -> None:
+    def prepare_metadata(
+        self,
+        metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> None:
         if not self._supports_prepared_metadata or not self._kv_bound:
-            raise RuntimeError("prepared metadata requires an initialized single-rank eager Qwen3 executor")
+            raise RuntimeError("prepared metadata requires an initialized single-rank Qwen3 executor")
         metadata.prepared_attention_state = self.attention_backend.prepare_metadata(metadata)
+        metadata.prepared_graph = None
+        if self.decode_graph_runner is not None:
+            if input_ids is None or positions is None:
+                raise ValueError("prepared ACL graph selection requires final input views")
+            metadata.prepared_graph = self.decode_graph_runner.select_prepared(input_ids, positions, metadata)
+
+    def prepared_graph_batch_sizes(self) -> list[int]:
+        if self.decode_graph_runner is None:
+            return []
+        if not self._supports_prepared_metadata:
+            raise ValueError("executor does not support prepared ACL graphs")
+        return self.decode_graph_runner.prepared_batch_sizes()
+
+    def warmup_prepared_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> None:
+        self.decode_graph_runner.warmup_prepared(input_ids, positions, metadata)
+
+    def freeze_prepared_graphs(self) -> None:
+        if self.decode_graph_runner is not None:
+            self.decode_graph_runner.freeze_prepared()
 
     def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
         layer_caches = normalize_layer_caches(kv_caches)
@@ -313,6 +342,13 @@ class ModelExecutor:
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
         graph_runner = self.decode_graph_runner
+        if getattr(metadata, "prepared_attention_state", None) is not None:
+            if mtp_topk_indices is not None:
+                raise ValueError("prepared metadata does not support MTP top-k state")
+            selection = getattr(metadata, "prepared_graph", None)
+            if selection is not None and selection.entry is not None:
+                return graph_runner.execute_prepared(selection, input_ids, positions, metadata)
+            return self.eager_runner.execute(input_ids, positions, metadata, input_embedding, layer_synchronizer)
         if (
             mtp_topk_indices is None
             and graph_runner is not None

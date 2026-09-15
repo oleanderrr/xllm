@@ -99,6 +99,8 @@ class PyAttentionMetadataView final {
   PyExpandedDecodeMetadataView expanded_decode_metadata() const;
   int64_t max_query_len() const;
   int64_t max_seq_len() const;
+  pybind11::object prepared_graph() const;
+  void set_prepared_graph(pybind11::object value);
   pybind11::object prepared_attention_state() const;
   void set_prepared_attention_state(pybind11::object value);
   pybind11::object dsa_metadata() const;
@@ -132,6 +134,7 @@ class PyAttentionMetadataView final {
   torch::Tensor linear_state_indices_;
   std::vector<int32_t> dp_execution_token_counts_;
   std::vector<int32_t> dp_is_decode_;
+  std::shared_ptr<void> prepared_graph_holder_;
   std::shared_ptr<void> prepared_attention_holder_;
   std::shared_ptr<void> dsa_metadata_holder_;
   torch::Tensor dsa_positions_;
