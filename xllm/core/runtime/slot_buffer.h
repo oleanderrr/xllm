@@ -23,30 +23,12 @@ limitations under the License.
 
 namespace xllm {
 
+struct ForwardInput;
+
 struct ModelInputCapacity {
   uint32_t max_tokens = 0;
   uint32_t max_sequences = 0;
   uint32_t max_blocks_per_sequence = 0;
-};
-
-// Borrows CPU data only until Prepare Ack. Positions have one axis and query
-// cumulative lengths contain row ends without a leading zero.
-struct ModelInputHostView {
-  std::span<const int32_t> token_ids;
-  std::span<const int32_t> positions;
-  std::span<const int32_t> new_cache_slots;
-  std::span<const int32_t> q_seq_lens;
-  std::span<const int32_t> kv_seq_lens;
-  std::span<const int32_t> q_cu_seq_lens;
-  std::span<const int32_t> block_tables;
-  uint32_t block_table_width = 0;
-};
-
-struct ModelInputBatch {
-  BatchForwardType forward_type;
-  uint32_t num_actual_sequences = 0;
-  uint64_t batch_id = 0;
-  bool is_graph_warmup = false;
 };
 
 struct SlotBufferCapacity {
@@ -80,17 +62,16 @@ class SlotBuffer final {
   SlotBuffer(const SlotBuffer&) = delete;
   SlotBuffer& operator=(const SlotBuffer&) = delete;
 
-  // Validate the complete input before any staging write. The owner may add
-  // model/KV checks, then prepare exactly this input on the validated stream.
-  Status validate(const ModelInputHostView& model,
-                  const ModelInputBatch& batch,
-                  const SamplingParameters& sampling,
+  // The owner supplies unpacked CPU input with checked transport types/layouts.
+  // Validate before staging writes; the owner may then add model/KV checks.
+  Status validate(const ForwardInput& input,
                   uint32_t previous_rows,
                   const Stream& stream) const;
-  void prepare(const ModelInputHostView& model,
-               const ModelInputBatch& batch,
-               const SamplingParameters& sampling,
-               const Stream& stream);
+  // An empty shard with an inherited nonempty forward type gets one reserved
+  // padding row for peer collectives, without an actual sequence or sample.
+  // All caller storage is released after Prepare; only Slot-owned copies
+  // remain.
+  void prepare(const ForwardInput& input, const Stream& stream);
   bool has_previous_tokens() const { return gather_count_ != 0; }
   void patch_previous_tokens(const torch::Tensor& previous_tokens);
 
@@ -113,6 +94,17 @@ class SlotBuffer final {
   uint64_t device_bytes() const;
 
  private:
+  // Borrows unpacked CPU storage during validation or preparation only.
+  struct ModelInputHostView {
+    std::span<const int32_t> token_ids;
+    std::span<const int32_t> positions;
+    std::span<const int32_t> new_cache_slots;
+    std::span<const int32_t> q_seq_lens;
+    std::span<const int32_t> kv_seq_lens;
+    std::span<const int32_t> q_cu_seq_lens;
+    std::span<const int32_t> block_tables;
+    uint32_t block_table_width = 0;
+  };
   struct Region {
     uint64_t offset = 0;
     uint64_t bytes = 0;
@@ -151,13 +143,16 @@ class SlotBuffer final {
                                   const Region& region);
   static ModelTensors bind_views(const torch::Tensor& buffer,
                                  const Layout& layout);
+  static ModelInputHostView model_input_view(const ForwardInput& input);
+  static Status validate_batch(const ModelInputHostView& model,
+                               const BatchInputMeta& batch);
   Status validate_model(const ModelInputHostView& model) const;
   Status validate_sampling(const SamplingParameters& sampling,
                            uint32_t tokens) const;
   Status validate_previous_tokens(const ModelInputHostView& model,
                                   uint32_t previous_rows) const;
   void prepare_model(const ModelInputHostView& model,
-                     const ModelInputBatch& batch);
+                     const BatchInputMeta& batch);
   void prepare_sampling(const SamplingParameters& sampling);
   void prepare_result();
   void prepare_previous_tokens(const ModelInputHostView& model);

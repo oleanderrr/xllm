@@ -23,7 +23,7 @@ DEFINE_bool(enable_task_pipeline,
             "Enable the task execution pipeline. Uses two slots with "
             "scheduler overlap and one slot without it. "
             "Python eager models with prepared attention metadata; "
-            "DP/CP/layerwise split are unsupported.");
+            "Supports DP; CP/KV/layerwise split are unsupported.");
 
 DEFINE_bool(
     enable_graph,

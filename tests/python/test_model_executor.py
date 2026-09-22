@@ -1370,7 +1370,7 @@ def test_executor_prepares_private_metadata_after_cache_binding() -> None:
 
 @pytest.mark.parametrize(
     "unsupported",
-    [{"dp_size": 2}, {"cp_size": 2}, {"kv_split_size": 2}, {"model_type": "llama"}],
+    [{"cp_size": 2}, {"kv_split_size": 2}, {"model_type": "llama"}],
 )
 def test_executor_rejects_unsupported_prepared_metadata(unsupported: dict[str, object]) -> None:
     backend = _PreparedStubAttentionBackend()
@@ -1414,7 +1414,7 @@ def test_executor_accepts_prepared_tensor_and_expert_parallel(
     assert metadata.prepared_attention_state.source == [1, 2]
 
 
-@pytest.mark.parametrize("split", ["dp_size", "cp_size", "kv_split_size", "layerwise_split_size"])
+@pytest.mark.parametrize("split", ["cp_size", "kv_split_size", "layerwise_split_size"])
 def test_executor_rejects_prepared_glm_split_topologies(split: str) -> None:
     with patch(
         "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
@@ -1442,3 +1442,13 @@ def test_prepared_executor_rejects_mtp_state_before_model_execution() -> None:
     with pytest.raises(ValueError, match="MTP top-k"):
         executor.execute(torch.zeros(2), torch.zeros(2), metadata, mtp_topk_indices=torch.zeros(2))
     executor.eager_runner.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
+def test_executor_accepts_prepared_data_parallel(model_type: str) -> None:
+    config = {"model_type": model_type, "dp_size": 2, "dp_rank": 1, "graph_backend": "off"}
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
+    assert executor.supports_prepared_metadata

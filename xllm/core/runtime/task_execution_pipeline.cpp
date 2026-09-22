@@ -64,6 +64,7 @@ Status TaskExecutionPipeline::create(
         "LLM task pipeline requires supported Python prepared metadata.");
   }
   if (capacity.slot_count == 0 || capacity.slot_count > 2 ||
+      capacity.dp_size == 0 || capacity.dp_rank >= capacity.dp_size ||
       capacity.model.max_sequences == 0 ||
       capacity.model.max_sequences > std::numeric_limits<int32_t>::max() ||
       model.device().type() != Platform::type_torch() ||
@@ -98,6 +99,9 @@ Status TaskExecutionPipeline::create(
     if (!status.ok()) {
       return status;
     }
+    auto& parallel = slot->buffer->model_params().parallel;
+    parallel.dp_global_token_nums.reserve(capacity.dp_size);
+    parallel.dp_is_decode.reserve(capacity.dp_size);
     slot->input_ready = std::make_shared<StreamEvent>(model.device().type());
     slot->output_ready = std::make_shared<StreamEvent>(model.device().type());
     pipeline->slots_.emplace_back(std::move(slot));
@@ -123,7 +127,8 @@ void TaskExecutionPipeline::check_external_thread() const {
   CHECK(std::this_thread::get_id() != launch_thread_.get_id());
 }
 
-Status TaskExecutionPipeline::validate_input(const ForwardInput& source) {
+Status TaskExecutionPipeline::validate_input(const ForwardInput& source,
+                                             const LlmTaskCapacity& capacity) {
   const auto& params = source.input_params;
   const auto& host = params.attention.host;
   const auto& meta = params.meta;
@@ -154,7 +159,6 @@ Status TaskExecutionPipeline::validate_input(const ForwardInput& source) {
       !params.multimodal.deep_stacks.empty() ||
       params.parallel.cp_plan.enabled() ||
       params.parallel.layer_wise_load_synchronizer != nullptr ||
-      params.parallel.dp_global_token_nums.size() > 1 ||
       params.expert.expert_load_data.defined() ||
       params.expert.expert_array.defined() ||
       params.expert.eplb_decode_token_mask.defined() ||
@@ -216,6 +220,29 @@ Status TaskExecutionPipeline::validate_input(const ForwardInput& source) {
     return Status(StatusCode::INVALID_ARGUMENT,
                   "Task pipeline requires unpadded CPU int32 model input.");
   }
+  // The fixed topology was already validated by create().
+  const int64_t local_tokens = empty ? 0 : tokens.numel();
+  if (local_tokens > std::numeric_limits<int32_t>::max()) {
+    return invalid("Invalid task DP token count.");
+  }
+  const auto& counts = params.parallel.dp_global_token_nums;
+  const auto& phases = params.parallel.dp_is_decode;
+  if (capacity.dp_size == 1 && counts.empty() && phases.empty()) {
+    return Status();
+  }
+  if (counts.size() != capacity.dp_size || phases.size() != capacity.dp_size ||
+      counts[capacity.dp_rank] != local_tokens ||
+      std::any_of(counts.begin(),
+                  counts.end(),
+                  [](int32_t count) { return count < 0; }) ||
+      std::any_of(phases.begin(),
+                  phases.end(),
+                  [](int32_t phase) { return phase != 0 && phase != 1; }) ||
+      (local_tokens != 0 &&
+       phases[capacity.dp_rank] !=
+           static_cast<int32_t>(meta.batch_forward_type.is_decode()))) {
+    return invalid("Task requires aligned unpadded DP counts and phases.");
+  }
   return Status();
 }
 
@@ -228,7 +255,7 @@ TaskSubmission TaskExecutionPipeline::submit(const ForwardInput& input) {
         input, device_.unwrap(), unpacked));
     source = &unpacked;
   }
-  const Status status = validate_input(*source);
+  const Status status = validate_input(*source, capacity_);
   if (!status.ok()) {
     return TaskSubmission{status, 0};
   }
@@ -343,28 +370,21 @@ TaskExecutionPipeline::~TaskExecutionPipeline() {
   CHECK(completed_.empty());
 }
 
-Status TaskExecutionPipeline::validate(
-    const Slot& slot,
-    const ModelInputHostView& model,
-    const ModelInputBatch& batch,
-    const SamplingParameters& sampling) const {
+Status TaskExecutionPipeline::validate(const Slot& slot,
+                                       const ForwardInput& input) const {
   Status status = slot.buffer->validate(
-      model,
-      batch,
-      sampling,
+      input,
       capacity_.slot_count == 2 ? accepted_tail_.sample_rows : 0,
       prepare_stream_);
   if (!status.ok()) {
     return status;
   }
-  const auto& host = model;
-  if (batch.num_actual_sequences != host.q_seq_lens.size() ||
-      batch.is_graph_warmup || sampling.return_probs ||
+  const auto& sampling = input.sampling_params;
+  if (sampling.return_probs ||
       (!sampling.logprobs && sampling.max_top_logprobs != 0)) {
-    return invalid(
-        "Ordinary LLM requires actual eager rows and token results.");
+    return invalid("Ordinary LLM requires consistent token result options.");
   }
-  if (host.token_ids.empty()) {
+  if (input.input_params.meta.batch_forward_type.is_empty()) {
     return Status();
   }
   if (kv_caches_.empty() || kv_caches_.front().empty()) {
@@ -372,6 +392,16 @@ Status TaskExecutionPipeline::validate(
   }
   const int64_t blocks = kv_caches_.front().get_k_cache().size(/*dim=*/0);
   const int64_t block_size = capacity_.block_size;
+  const auto& host = input.input_params.attention.host;
+  const auto tokens = int_span(input.host_token_ids());
+  const auto positions = int_span(input.host_positions());
+  const auto page_table = int_span(host.block_tables);
+  const auto cache_slots =
+      host.new_cache_slots.empty()
+          ? int_span(input.input_params.attention.device.new_cache_slots)
+          : std::span<const int32_t>(host.new_cache_slots);
+  const int64_t block_table_width =
+      host.block_tables.defined() ? host.block_tables.size(/*dim=*/1) : 0;
   int64_t offset = 0;
   for (uint32_t row = 0; row < host.q_seq_lens.size(); ++row) {
     const int32_t q = host.q_seq_lens[row];
@@ -379,31 +409,30 @@ Status TaskExecutionPipeline::validate(
     // Prefix-cache hits also have q < kv when scheduler chunking is disabled.
     // SlotBuffer validates the row lengths against the batch forward type.
     if (static_cast<uint32_t>(kv) > capacity_.max_kv_seq_len ||
-        (kv + block_size - 1) / block_size > host.block_table_width) {
+        (kv + block_size - 1) / block_size > block_table_width) {
       return invalid("KV length exceeds the LLM contract.");
     }
     for (int32_t index = 0; index < q; ++index, ++offset) {
-      const int32_t position = host.positions[offset];
-      const int32_t token = host.token_ids[offset];
+      const int32_t position = positions[offset];
+      const int32_t token = tokens[offset];
       if (position != kv - q + index || position < 0 ||
           static_cast<uint32_t>(position) >= capacity_.max_positions ||
           (token >= 0 &&
            static_cast<uint32_t>(token) >= capacity_.vocab_size)) {
         return invalid("Invalid ordinary token or rotary position.");
       }
-      const int32_t block = host.block_tables[static_cast<uint64_t>(row) *
-                                                  host.block_table_width +
-                                              position / block_size];
-      if (host.new_cache_slots[offset] !=
-          block * block_size + position % block_size) {
+      const int32_t block =
+          page_table[static_cast<uint64_t>(row) * block_table_width +
+                     position / block_size];
+      if (cache_slots[offset] != block * block_size + position % block_size) {
         return invalid("KV write slot does not match the row's page table.");
       }
     }
   }
   if (std::any_of(
-          host.block_tables.begin(),
-          host.block_tables.end(),
-          [blocks](int32_t block) { return block < 0 || block >= blocks; })) {
+          page_table.begin(), page_table.end(), [blocks](int32_t block) {
+            return block < 0 || block >= blocks;
+          })) {
     return invalid("KV page index is outside allocated cache.");
   }
   return Status();
@@ -419,34 +448,16 @@ Status TaskExecutionPipeline::prepare(uint32_t slot_id,
   const auto& host = input_params.attention.host;
   const auto& meta = input_params.meta;
   const auto& tokens = input.host_token_ids();
-  const auto& positions = input.host_positions();
-  const auto& cache_slots = input_params.attention.device.new_cache_slots;
-  const bool empty = !tokens.defined() || tokens.numel() == 0;
+  const uint32_t local_tokens =
+      tokens.defined() ? static_cast<uint32_t>(tokens.numel()) : 0;
   const uint32_t rows = static_cast<uint32_t>(host.q_seq_lens.size());
-  // BatchInputBuilder leaves actual_num_sequences unset before Worker prepare.
-  // ProfileManager also marks ordinary eager warmup as is_graph_warmup.
-  // It is an output-metrics marker here, not permission for graph execution.
-  // The Slot preserves it in the detached response; execution remains eager.
-  const ModelInputBatch batch{
-      meta.batch_forward_type, rows, meta.batch_id, false};
-  const ModelInputHostView model{
-      int_span(tokens),
-      int_span(positions),
-      host.new_cache_slots.empty()
-          ? int_span(cache_slots)
-          : std::span<const int32_t>(host.new_cache_slots),
-      host.q_seq_lens,
-      host.kv_seq_lens,
-      host.q_cu_seq_lens,
-      int_span(host.block_tables),
-      empty ? 0 : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1))};
-  Status status = validate(slot, model, batch, input.sampling_params);
+  const Status status = validate(slot, input);
   if (!status.ok()) {
     return status;
   }
   c10::DeviceGuard guard(device_.unwrap());
-  slot.buffer->prepare(model, batch, input.sampling_params, prepare_stream_);
-  if (!model.token_ids.empty()) {
+  slot.buffer->prepare(input, prepare_stream_);
+  if (slot.buffer->tokens().numel() != 0) {
     executor_.prepare_attention_metadata(kv_caches_,
                                          slot.buffer->model_params());
   }
@@ -455,6 +466,13 @@ Status TaskExecutionPipeline::prepare(uint32_t slot_id,
       params.sample_idxes.defined() ? params.sample_idxes.numel() : 0;
   slot.sampling = params;
   slot.is_warmup = meta.is_graph_warmup;
+  VLOG(1) << "Task pipeline DP input: rank=" << capacity_.dp_rank
+          << " batch_id=" << meta.batch_id << " local_tokens=" << local_tokens
+          << " local_rows=" << rows << " samples=" << samples
+          << " forward_type=" << meta.batch_forward_type.to_string()
+          << " logical_counts="
+          << slot.buffer->model_params().parallel.dp_global_token_nums
+          << " phases=" << slot.buffer->model_params().parallel.dp_is_decode;
   prepare_stream_.record_event(*slot.input_ready);
   CHECK_LT(accepted_tail_.id, std::numeric_limits<uint64_t>::max());
   slot.expected_producer = accepted_tail_;

@@ -25,6 +25,8 @@ limitations under the License.
 
 #include "core/framework/sampling/sampler.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/runtime/forward_params.h"
+#include "core/runtime/py_attention_metadata.h"
 
 namespace xllm {
 namespace {
@@ -59,15 +61,31 @@ InputData make_input(std::vector<int32_t> query, std::vector<int32_t> kv) {
   return input;
 }
 
-ModelInputHostView view(const InputData& input) {
-  return {input.tokens,
-          input.positions,
-          input.slots,
-          input.query,
-          input.kv,
-          input.cumulative,
-          input.blocks,
-          input.width};
+ForwardInput make_forward_input(const InputData& input,
+                                BatchForwardType type,
+                                int32_t actual_rows,
+                                uint64_t batch_id = 0,
+                                bool is_warmup = false) {
+  ForwardInput forward;
+  forward.token_ids = torch::tensor(input.tokens, torch::kInt32);
+  forward.positions = torch::tensor(input.positions, torch::kInt32);
+  auto& host = forward.input_params.attention.host;
+  host.new_cache_slots = input.slots;
+  host.q_seq_lens = input.query;
+  host.kv_seq_lens = input.kv;
+  host.q_cu_seq_lens = input.cumulative;
+  if (!input.blocks.empty()) {
+    host.block_tables =
+        torch::tensor(input.blocks, torch::kInt32)
+            .reshape({static_cast<int64_t>(input.query.size()), input.width});
+  }
+  auto& meta = forward.input_params.meta;
+  meta.batch_forward_type = type;
+  meta.actual_num_sequences = actual_rows;
+  meta.num_sequences = static_cast<int32_t>(input.query.size());
+  meta.batch_id = batch_id;
+  meta.is_graph_warmup = is_warmup;
+  return forward;
 }
 
 class SlotBufferTest : public ::testing::Test {
@@ -81,12 +99,10 @@ class SlotBufferTest : public ::testing::Test {
 
   void TearDown() override { EXPECT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS); }
 
-  Status prepare_model(const ModelInputHostView& input,
-                       const ModelInputBatch& batch,
-                       const Stream& stream) {
-    Status status = binding_->validate(input, batch, {}, 0, stream);
+  Status prepare_model(const ForwardInput& input, const Stream& stream) {
+    Status status = binding_->validate(input, 0, stream);
     if (status.ok()) {
-      binding_->prepare(input, batch, {}, stream);
+      binding_->prepare(input, stream);
       ready_ = stream.record_event();
     }
     return status;
@@ -132,14 +148,13 @@ class SlotBufferTest : public ::testing::Test {
     }
   }
 
-  void expect_rejected(const ModelInputHostView& input,
-                       const ModelInputBatch& batch) {
+  void expect_rejected(const ForwardInput& input) {
     const torch::Tensor before = binding_->tokens().cpu().clone();
     const uint64_t batch_id = binding_->model_params().meta.batch_id;
     const std::vector<int32_t> lengths =
         binding_->model_params().attention.host.kv_seq_lens;
     const void* tokens = binding_->tokens().data_ptr();
-    EXPECT_FALSE(prepare_model(input, batch, *transfer_).ok());
+    EXPECT_FALSE(prepare_model(input, *transfer_).ok());
     EXPECT_TRUE(torch::equal(before, binding_->tokens().cpu()));
     EXPECT_EQ(binding_->model_params().meta.batch_id, batch_id);
     EXPECT_EQ(binding_->model_params().attention.host.kv_seq_lens, lengths);
@@ -156,10 +171,9 @@ class SlotBufferTest : public ::testing::Test {
 
 TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   InputData input = make_input({3, 2}, {3, 2});
-  ASSERT_TRUE(prepare_model(view(input),
-                            {BatchForwardType::PREFILL, 2, 41, true},
-                            *transfer_)
-                  .ok());
+  const auto forward =
+      make_forward_input(input, BatchForwardType::PREFILL, 2, 41, true);
+  ASSERT_TRUE(prepare_model(forward, *transfer_).ok());
   expect_device_input(input);
   const ModelInputParams& params = binding_->model_params();
   EXPECT_EQ(params.attention.host.kv_cache_tokens_nums,
@@ -168,7 +182,8 @@ TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   EXPECT_EQ(params.meta.num_sequences, 2);
   EXPECT_EQ(params.meta.actual_num_sequences, 2);
   EXPECT_EQ(params.meta.batch_id, 41);
-  EXPECT_TRUE(params.meta.is_graph_warmup);
+  EXPECT_FALSE(params.meta.is_graph_warmup);
+  EXPECT_TRUE(forward.input_params.meta.is_graph_warmup);
   EXPECT_EQ(params.meta.q_max_seq_len, 3);
   EXPECT_EQ(params.meta.kv_max_seq_len, 3);
   EXPECT_EQ(params.attention.device.block_tables.stride(0), 5);
@@ -179,10 +194,126 @@ TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   EXPECT_FALSE(params.attention.device.kv_cache_tokens_nums.defined());
 }
 
+TEST_F(SlotBufferTest, EmptyDpShardClearsSamplingAndPreviousTokenMapping) {
+  InputData active = make_input({2, 1}, {2, 1});
+  active.tokens.back() = -1;
+  SamplingParameters sampling;
+  sampling.selected_token_idxes = torch::tensor({2}, torch::kInt32);
+  sampling.sample_idxes = torch::tensor({0}, torch::kInt32);
+  sampling.do_sample = torch::tensor({false}, torch::kBool);
+  auto forward = make_forward_input(active, BatchForwardType::PREFILL, 2);
+  forward.sampling_params = sampling;
+  ASSERT_TRUE(binding_
+                  ->validate(forward,
+                             /*previous_rows=*/1,
+                             *transfer_)
+                  .ok());
+  binding_->prepare(forward, *transfer_);
+  ready_ = transfer_->record_event();
+  expect_device_input(active);
+  ASSERT_TRUE(binding_->has_previous_tokens());
+  const void* tokens = binding_->tokens().data_ptr();
+  const InputData padding{{1}, {0}, {0}, {1}, {1}, {1}, {0}, 1};
+  for (const BatchForwardType forward_type : {BatchForwardType::PREFILL,
+                                              BatchForwardType::CHUNKED_PREFILL,
+                                              BatchForwardType::DECODE,
+                                              BatchForwardType::MIXED}) {
+    ASSERT_TRUE(
+        prepare_model(make_forward_input({}, forward_type, 0, 73), *transfer_)
+            .ok());
+    expect_device_input(padding);
+    EXPECT_EQ(binding_->tokens().data_ptr(), tokens);
+    EXPECT_EQ(binding_->tokens().numel(), 1);
+    EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 0);
+    EXPECT_EQ(binding_->model_params().meta.num_sequences, 1);
+    EXPECT_EQ(binding_->model_params().meta.batch_id, 73);
+    EXPECT_EQ(binding_->model_params().meta.batch_forward_type.value(),
+              forward_type.value());
+    EXPECT_FALSE(binding_->has_previous_tokens());
+    EXPECT_FALSE(binding_->sampling_params().selected_token_idxes.defined());
+    EXPECT_FALSE(binding_->device_result().tokens.defined());
+  }
+  ASSERT_TRUE(prepare_model(make_forward_input({}, BatchForwardType::EMPTY, 0),
+                            *transfer_)
+                  .ok());
+  EXPECT_EQ(binding_->tokens().numel(), 0);
+  EXPECT_EQ(binding_->model_params().meta.num_sequences, 0);
+}
+
+TEST_F(SlotBufferTest, DpMetadataStaysPrivateAcrossSlotPreparationAndReuse) {
+  std::unique_ptr<SlotBuffer> second;
+  ASSERT_TRUE(SlotBuffer::create(capacity_, device_, second).ok());
+  InputData active = make_input({2, 1}, {2, 1});
+  ParallelInput input;
+  input.dp_global_token_nums = {3, 0};
+  input.raw_dp_global_token_nums = {3, 0};
+  input.dp_is_decode = {0, 0};
+  input.dp_global_kv_max_seq_lens = {2, 0};
+  input.dp_global_batch_generations = {1, 0};
+  input.dp_global_sequence_nums = {2, 0};
+  auto forward = make_forward_input(active, BatchForwardType::PREFILL, 2);
+  forward.input_params.parallel = input;
+  binding_->prepare(forward, *transfer_);
+  ready_ = transfer_->record_event();
+  expect_device_input(active);
+  auto& first_params = binding_->model_params();
+  PyAttentionMetadataView first_view(first_params.attn_metadata, first_params);
+  const int32_t* counts = first_params.parallel.dp_global_token_nums.data();
+  const int32_t* phases = first_params.parallel.dp_is_decode.data();
+  EXPECT_TRUE(first_params.parallel.raw_dp_global_token_nums.empty());
+  EXPECT_TRUE(first_params.parallel.dp_global_kv_max_seq_lens.empty());
+  EXPECT_TRUE(first_params.parallel.dp_global_batch_generations.empty());
+  EXPECT_TRUE(first_params.parallel.dp_global_sequence_nums.empty());
+
+  input.dp_global_token_nums = {0, 4};
+  input.raw_dp_global_token_nums = input.dp_global_token_nums;
+  input.dp_is_decode = {0, 1};
+  auto idle = make_forward_input({}, BatchForwardType::DECODE, 0, 74);
+  idle.input_params.parallel = input;
+  ASSERT_TRUE(second->validate(idle, 0, *transfer_).ok());
+  second->prepare(idle, *transfer_);
+  const auto& second_params = second->model_params();
+  PyAttentionMetadataView second_view(second_params.attn_metadata,
+                                      second_params);
+  EXPECT_EQ(first_params.parallel.dp_global_token_nums,
+            (std::vector<int32_t>{3, 0}));
+  EXPECT_EQ(first_view.dp_execution_token_counts(),
+            (std::vector<int32_t>{3, 1}));
+  EXPECT_EQ(second_params.meta.actual_num_sequences, 0);
+  EXPECT_FALSE(second->sampling_params().selected_token_idxes.defined());
+
+  // Reusing the retired first Slot must preserve both the other Slot and the
+  // DP snapshot already handed to Python. Its vector storage stays allocated.
+  active = make_input({1}, {1});
+  input.dp_global_token_nums = {1, 2};
+  input.raw_dp_global_token_nums = input.dp_global_token_nums;
+  input.dp_is_decode = {1, 1};
+  forward = make_forward_input(active, BatchForwardType::DECODE, 1);
+  forward.input_params.parallel = input;
+  binding_->prepare(forward, *transfer_);
+  PyAttentionMetadataView reused_view(first_params.attn_metadata, first_params);
+  EXPECT_EQ(first_params.parallel.dp_global_token_nums.data(), counts);
+  EXPECT_EQ(first_params.parallel.dp_is_decode.data(), phases);
+  EXPECT_EQ(reused_view.dp_execution_token_counts(),
+            (std::vector<int32_t>{1, 2}));
+  EXPECT_EQ(reused_view.dp_is_decode(), (std::vector<int32_t>{1, 1}));
+  EXPECT_EQ(first_view.dp_execution_token_counts(),
+            (std::vector<int32_t>{3, 1}));
+  EXPECT_EQ(first_view.dp_is_decode(), (std::vector<int32_t>{0, 0}));
+  EXPECT_EQ(second_params.parallel.dp_global_token_nums,
+            (std::vector<int32_t>{0, 4}));
+  EXPECT_EQ(second_view.dp_execution_token_counts(),
+            (std::vector<int32_t>{1, 4}));
+  EXPECT_EQ(second_view.dp_is_decode(), (std::vector<int32_t>{0, 1}));
+  ready_ = transfer_->record_event();
+  expect_device_input(active);
+}
+
 TEST_F(SlotBufferTest, MixedBatchKeepsActualAndPaddingRowsDistinct) {
   InputData input = make_input({2, 1, 0}, {5, 7, 0});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::MIXED, 2, 42}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::MIXED, 2, 42),
+                    *transfer_)
           .ok());
   expect_device_input(input);
   EXPECT_EQ(binding_->model_params().meta.num_sequences, 3);
@@ -195,8 +326,8 @@ TEST_F(SlotBufferTest, MixedBatchKeepsActualAndPaddingRowsDistinct) {
 
 TEST_F(SlotBufferTest, VaryingSizesReuseAddressesAndHostCapacity) {
   InputData first = make_input({2, 2, 2, 2}, {7, 7, 7, 7});
-  ASSERT_TRUE(prepare_model(view(first),
-                            {BatchForwardType::CHUNKED_PREFILL, 4},
+  ASSERT_TRUE(prepare_model(make_forward_input(
+                                first, BatchForwardType::CHUNKED_PREFILL, 4),
                             *transfer_)
                   .ok());
   expect_device_input(first);
@@ -211,10 +342,11 @@ TEST_F(SlotBufferTest, VaryingSizesReuseAddressesAndHostCapacity) {
     InputData input = make_input(std::vector<int32_t>(rows, 1),
                                  std::vector<int32_t>(rows, iteration + 2));
     input.tokens[0] += static_cast<int32_t>(iteration);
-    ASSERT_TRUE(prepare_model(view(input),
-                              {BatchForwardType::DECODE, rows, iteration},
-                              *transfer_)
-                    .ok());
+    ASSERT_TRUE(
+        prepare_model(make_forward_input(
+                          input, BatchForwardType::DECODE, rows, iteration),
+                      *transfer_)
+            .ok());
     expect_device_input(input);
     EXPECT_EQ(host.q_seq_lens.data(), lengths);
     EXPECT_EQ(host.new_cache_slots.data(), slots);
@@ -228,15 +360,18 @@ TEST_F(SlotBufferTest, VaryingSizesReuseAddressesAndHostCapacity) {
 
 TEST_F(SlotBufferTest, EmptyBatchClearsViewsAndMetadataWithoutReallocation) {
   InputData input = make_input({3, 2}, {8, 9});
-  ASSERT_TRUE(prepare_model(view(input),
-                            {BatchForwardType::CHUNKED_PREFILL, 2, 51, true},
-                            *transfer_)
-                  .ok());
+  ASSERT_TRUE(
+      prepare_model(make_forward_input(
+                        input, BatchForwardType::CHUNKED_PREFILL, 2, 51, true),
+                    *transfer_)
+          .ok());
   expect_device_input(input);
   const size_t capacity =
       binding_->model_params().attention.host.q_seq_lens.capacity();
   ASSERT_TRUE(
-      prepare_model({}, {BatchForwardType::EMPTY, 0, 52}, *transfer_).ok());
+      prepare_model(make_forward_input({}, BatchForwardType::EMPTY, 0, 52),
+                    *transfer_)
+          .ok());
   CHECK(consumer_->wait_event(ready_));
   ASSERT_EQ(consumer_->synchronize(), 0);
   EXPECT_EQ(binding_->tokens().numel(), 0);
@@ -257,71 +392,73 @@ TEST_F(SlotBufferTest, EmptyBatchClearsViewsAndMetadataWithoutReallocation) {
 TEST_F(SlotBufferTest, InvalidBatchSemanticsPreservePreviousBinding) {
   InputData input = make_input({2, 1}, {5, 7});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::MIXED, 2, 63}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::MIXED, 2, 63),
+                    *transfer_)
           .ok());
   expect_device_input(input);
-  for (const ModelInputBatch& batch :
-       {ModelInputBatch{BatchForwardType(999), 2},
-        ModelInputBatch{BatchForwardType::DECODE, 2},
-        ModelInputBatch{BatchForwardType::PREFILL, 2},
-        ModelInputBatch{BatchForwardType::MIXED, 3},
-        ModelInputBatch{BatchForwardType::EMPTY, 0}}) {
-    expect_rejected(view(input), batch);
+  expect_rejected(make_forward_input(input, BatchForwardType(999), 2));
+  for (const BatchForwardType type : {BatchForwardType::DECODE,
+                                      BatchForwardType::PREFILL,
+                                      BatchForwardType::EMPTY}) {
+    expect_rejected(make_forward_input(input, type, 2));
   }
+  expect_rejected(make_forward_input(input, BatchForwardType::MIXED, 3));
   InputData zero_query = make_input({2, 0}, {5, 7});
-  expect_rejected(view(zero_query), {BatchForwardType::MIXED, 2});
-  expect_rejected({}, {BatchForwardType::DECODE, 0});
+  expect_rejected(make_forward_input(zero_query, BatchForwardType::MIXED, 2));
+  expect_rejected(make_forward_input({}, BatchForwardType::DECODE, 1));
+  expect_rejected(make_forward_input({}, BatchForwardType(999), 0));
 }
 
 TEST_F(SlotBufferTest, InvalidTransferInputPreservesPreviousBinding) {
   InputData input = make_input({1}, {4});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::DECODE, 1, 71}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::DECODE, 1, 71),
+                    *transfer_)
           .ok());
   expect_device_input(input);
   InputData wrong_shape = make_input({2}, {5});
   wrong_shape.positions.pop_back();
-  expect_rejected(view(wrong_shape), {BatchForwardType::CHUNKED_PREFILL, 1});
+  expect_rejected(
+      make_forward_input(wrong_shape, BatchForwardType::CHUNKED_PREFILL, 1));
   InputData oversized = make_input({17}, {17});
-  expect_rejected(view(oversized), {BatchForwardType::PREFILL, 1});
+  expect_rejected(make_forward_input(oversized, BatchForwardType::PREFILL, 1));
 }
 
-TEST_F(SlotBufferTest, NextInputCanBorrowPreviousHostMetadata) {
+TEST_F(SlotBufferTest, HostTensorFallbacksArePreparedBeforeReuse) {
   InputData first = make_input({2, 1}, {4, 3});
-  ASSERT_TRUE(prepare_model(view(first),
-                            {BatchForwardType::CHUNKED_PREFILL, 2},
+  ASSERT_TRUE(prepare_model(make_forward_input(
+                                first, BatchForwardType::CHUNKED_PREFILL, 2),
                             *transfer_)
                   .ok());
   expect_device_input(first);
   InputData next = make_input({2, 2}, {2, 3});
-  ModelInputHostView borrowed = view(next);
-  borrowed.q_seq_lens =
-      binding_->model_params().attention.host.kv_cache_tokens_nums;
-  borrowed.kv_seq_lens = binding_->model_params().attention.host.q_cu_seq_lens;
-  ASSERT_TRUE(prepare_model(
-                  borrowed, {BatchForwardType::CHUNKED_PREFILL, 2}, *transfer_)
-                  .ok());
+  auto forward = make_forward_input(next, BatchForwardType::CHUNKED_PREFILL, 2);
+  forward.input_params.attention.host.new_cache_slots.clear();
+  forward.input_params.attention.device.new_cache_slots =
+      torch::tensor(next.slots, torch::kInt32);
+  ASSERT_TRUE(prepare_model(forward, *transfer_).ok());
   expect_device_input(next);
   EXPECT_EQ(binding_->model_params().attention.host.kv_seq_lens, next.kv);
   EXPECT_EQ(binding_->model_params().attention.host.kv_cache_tokens_nums,
             (std::vector<int32_t>{0, 1}));
 }
 
-TEST_F(SlotBufferTest, CallerSuppliedDummyRowHasNoActualSequence) {
+TEST_F(SlotBufferTest, UnsetActualSequenceCountUsesLogicalRows) {
   InputData input = make_input({1}, {1});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::DECODE, 0}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::DECODE, 0),
+                    *transfer_)
           .ok());
   expect_device_input(input);
   EXPECT_EQ(binding_->model_params().meta.num_sequences, 1);
-  EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 0);
+  EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 1);
   EXPECT_EQ(binding_->tokens().numel(), 1);
 }
 
 TEST_F(SlotBufferTest, PythonMetadataIsPrivateAndUsesFixedViews) {
   InputData first = make_input({3, 2}, {3, 2});
-  ASSERT_TRUE(prepare_model(view(first),
-                            {BatchForwardType::PREFILL, 2, 1, false},
+  ASSERT_TRUE(prepare_model(make_forward_input(
+                                first, BatchForwardType::PREFILL, 2, 1, false),
                             *transfer_)
                   .ok());
   const auto metadata = binding_->model_params().attn_metadata;
@@ -330,10 +467,10 @@ TEST_F(SlotBufferTest, PythonMetadataIsPrivateAndUsesFixedViews) {
   std::unique_ptr<SlotBuffer> other;
   ASSERT_TRUE(SlotBuffer::create(capacity_, device_, other).ok());
   const InputData second = make_input({1}, {4});
-  const ModelInputBatch second_batch{BatchForwardType::DECODE, 1, 2, false};
-  ASSERT_TRUE(
-      other->validate(view(second), second_batch, {}, 0, *transfer_).ok());
-  other->prepare(view(second), second_batch, {}, *transfer_);
+  const auto forward =
+      make_forward_input(second, BatchForwardType::DECODE, 1, 2);
+  ASSERT_TRUE(other->validate(forward, 0, *transfer_).ok());
+  other->prepare(forward, *transfer_);
   first.query.assign(first.query.size(), /*value=*/-99);
   EXPECT_EQ(metadata->q_seq_lens_vec, (std::vector<int32_t>{3, 2}));
   EXPECT_EQ(metadata->q_cu_seq_lens_host_vec, (std::vector<int64_t>{3, 5}));
@@ -365,7 +502,8 @@ TEST_F(SlotBufferTest, MlaKeepsFinalBlockTableForEveryForwardType) {
         decode ? std::vector<int32_t>{1, 1} : std::vector<int32_t>{3, 2},
         type.is_prefill() ? std::vector<int32_t>{3, 2}
                           : std::vector<int32_t>{6, 4});
-    ASSERT_TRUE(prepare_model(view(input), {type, 2}, *transfer_).ok());
+    ASSERT_TRUE(
+        prepare_model(make_forward_input(input, type, 2), *transfer_).ok());
     expect_device_input(input);
     const auto metadata = binding_->model_params().attn_metadata;
     ASSERT_TRUE(metadata->block_table.defined());
@@ -388,58 +526,59 @@ TEST_F(SlotBufferTest, MlaKeepsFinalBlockTableForEveryForwardType) {
 }
 
 TEST_F(SlotBufferTest, CallerMayOverwriteModelDataAfterPrepare) {
-  InputData input = make_input({2, 1}, {2, 1});
-  const InputData expected = input;
-  ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::PREFILL, 2}, *transfer_)
-          .ok());
-  std::fill(input.tokens.begin(), input.tokens.end(), -99);
-  std::fill(input.blocks.begin(), input.blocks.end(), -99);
+  const InputData expected = make_input({2, 1}, {2, 1});
+  auto input = make_forward_input(expected, BatchForwardType::PREFILL, 2);
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  input.token_ids.fill_(-99);
+  input.input_params.attention.host.block_tables.fill_(-99);
+  input.input_params.attention.host.q_seq_lens.assign(2, -99);
   expect_device_input(expected);
 }
 
 TEST_F(SlotBufferTest, RejectsShapeCapacityAndStagingAliasesWithoutWrites) {
   InputData input = make_input({2, 1}, {4, 3});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::MIXED, 2}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::MIXED, 2),
+                    *transfer_)
           .ok());
   expect_device_input(input);
-  auto invalid = view(input);
-  invalid.block_tables = std::span<const int32_t>(
-      binding_->model_params().attention.host.block_tables.data_ptr<int32_t>(),
-      input.blocks.size());
-  expect_rejected(invalid, {BatchForwardType::MIXED, 2});
-  invalid = view(input);
-  invalid.kv_seq_lens = invalid.kv_seq_lens.first(1);
-  expect_rejected(invalid, {BatchForwardType::MIXED, 2});
-  invalid = view(input);
-  invalid.new_cache_slots = {};
-  expect_rejected(invalid, {BatchForwardType::MIXED, 2});
-  invalid = view(input);
-  invalid.block_table_width = 6;
-  expect_rejected(invalid, {BatchForwardType::MIXED, 2});
+  auto invalid = make_forward_input(input, BatchForwardType::MIXED, 2);
+  invalid.input_params.attention.host.block_tables =
+      binding_->model_params().attention.host.block_tables;
+  expect_rejected(invalid);
+  invalid = make_forward_input(input, BatchForwardType::MIXED, 2);
+  invalid.input_params.attention.host.kv_seq_lens.resize(1);
+  expect_rejected(invalid);
+  invalid = make_forward_input(input, BatchForwardType::MIXED, 2);
+  invalid.input_params.attention.host.new_cache_slots.clear();
+  expect_rejected(invalid);
+  invalid = make_forward_input(input, BatchForwardType::MIXED, 2);
+  invalid.input_params.attention.host.block_tables =
+      torch::zeros({2, 6}, torch::kInt32);
+  expect_rejected(invalid);
   InputData bad = input;
   bad.cumulative.back() -= 1;
-  expect_rejected(view(bad), {BatchForwardType::MIXED, 2});
+  expect_rejected(make_forward_input(bad, BatchForwardType::MIXED, 2));
   bad = input;
   bad.query[0] = -1;
-  expect_rejected(view(bad), {BatchForwardType::MIXED, 2});
+  expect_rejected(make_forward_input(bad, BatchForwardType::MIXED, 2));
   bad = input;
   bad.kv[0] = 0;
-  expect_rejected(view(bad), {BatchForwardType::MIXED, 2});
+  expect_rejected(make_forward_input(bad, BatchForwardType::MIXED, 2));
   bad = make_input({1, 1, 1, 1, 1}, {1, 1, 1, 1, 1});
-  expect_rejected(view(bad), {BatchForwardType::PREFILL, 5});
-  invalid = {};
-  invalid.block_table_width = 1;
-  expect_rejected(invalid, {BatchForwardType::EMPTY, 0});
+  expect_rejected(make_forward_input(bad, BatchForwardType::PREFILL, 5));
+  invalid = make_forward_input({}, BatchForwardType::EMPTY, 0);
+  invalid.input_params.attention.host.block_tables =
+      torch::zeros({1, 1}, torch::kInt32);
+  expect_rejected(invalid);
 }
 
 TEST_F(SlotBufferTest, PreviousRowsReorderDuplicateAndRejectAtomically) {
   InputData input = make_input({2, 1, 1}, {2, 1, 1});
   input.tokens = {42, -2, -1, -2};
-  const ModelInputBatch batch{BatchForwardType::MIXED, 3};
-  ASSERT_TRUE(binding_->validate(view(input), batch, {}, 2, *transfer_).ok());
-  binding_->prepare(view(input), batch, {}, *transfer_);
+  auto forward = make_forward_input(input, BatchForwardType::MIXED, 3);
+  ASSERT_TRUE(binding_->validate(forward, 2, *transfer_).ok());
+  binding_->prepare(forward, *transfer_);
   ready_ = transfer_->record_event();
   ASSERT_TRUE(consumer_->wait_event(ready_));
   auto guard = consumer_->set_stream_guard();
@@ -453,23 +592,23 @@ TEST_F(SlotBufferTest, PreviousRowsReorderDuplicateAndRejectAtomically) {
         {42, -3, 13, 14},
         {42, std::numeric_limits<int32_t>::min(), 13, 14}}) {
     input.tokens = tokens;
-    EXPECT_FALSE(
-        binding_->validate(view(input), batch, {}, 2, *transfer_).ok());
+    forward = make_forward_input(input, BatchForwardType::MIXED, 3);
+    EXPECT_FALSE(binding_->validate(forward, 2, *transfer_).ok());
     EXPECT_TRUE(torch::equal(binding_->tokens().cpu(), retained));
     EXPECT_TRUE(binding_->has_previous_tokens());
   }
-  EXPECT_FALSE(binding_->validate(view(input), batch, {}, 5, *transfer_).ok());
-  ASSERT_TRUE(
-      binding_->validate({}, {BatchForwardType::EMPTY, 0}, {}, 0, *transfer_)
-          .ok());
-  binding_->prepare({}, {BatchForwardType::EMPTY, 0}, {}, *transfer_);
+  EXPECT_FALSE(binding_->validate(forward, 5, *transfer_).ok());
+  forward = make_forward_input({}, BatchForwardType::EMPTY, 0);
+  ASSERT_TRUE(binding_->validate(forward, 0, *transfer_).ok());
+  binding_->prepare(forward, *transfer_);
   EXPECT_FALSE(binding_->has_previous_tokens());
 }
 
 TEST_F(SlotBufferTest, InvalidSamplingDoesNotOverwriteModelOrPreviousMapping) {
   InputData input = make_input({1, 1}, {1, 1});
   ASSERT_TRUE(
-      prepare_model(view(input), {BatchForwardType::DECODE, 2}, *transfer_)
+      prepare_model(make_forward_input(input, BatchForwardType::DECODE, 2),
+                    *transfer_)
           .ok());
   expect_device_input(input);
   const auto before = binding_->tokens().cpu();
@@ -478,13 +617,9 @@ TEST_F(SlotBufferTest, InvalidSamplingDoesNotOverwriteModelOrPreviousMapping) {
   sampling.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
   sampling.sample_idxes = torch::tensor({0, 1}, torch::kInt32);
   sampling.do_sample = torch::zeros({2}, torch::kInt32);
-  EXPECT_FALSE(binding_
-                   ->validate(view(input),
-                              {BatchForwardType::DECODE, 2},
-                              sampling,
-                              2,
-                              *transfer_)
-                   .ok());
+  auto forward = make_forward_input(input, BatchForwardType::DECODE, 2);
+  forward.sampling_params = sampling;
+  EXPECT_FALSE(binding_->validate(forward, 2, *transfer_).ok());
   EXPECT_FALSE(binding_->has_previous_tokens());
   EXPECT_FALSE(binding_->sampling_params().selected_token_idxes.defined());
   EXPECT_TRUE(torch::equal(binding_->tokens().cpu(), before));
@@ -499,7 +634,8 @@ TEST_F(SlotBufferTest, NarrowAndFullBlockTablesReuseStrideWithoutStalePages) {
     input.blocks.resize(2 * width);
     std::iota(input.blocks.begin(), input.blocks.end(), 401);
     ASSERT_TRUE(
-        prepare_model(view(input), {BatchForwardType::DECODE, 2}, *transfer_)
+        prepare_model(make_forward_input(input, BatchForwardType::DECODE, 2),
+                      *transfer_)
             .ok());
     expect_device_input(input);
     EXPECT_EQ(binding_->pinned_bytes(), pinned);
@@ -594,12 +730,14 @@ class SlotSamplingInputTest
     if (tokens == 0) {
       model.width = 0;
     }
-    const ModelInputBatch batch{
+    auto forward = make_forward_input(
+        model,
         tokens == 0 ? BatchForwardType::EMPTY : BatchForwardType::PREFILL,
-        tokens == 0 ? 0U : 1U};
-    Status status = binding_->validate(view(model), batch, input, 0, stream);
+        tokens == 0 ? 0 : 1);
+    forward.sampling_params = input;
+    Status status = binding_->validate(forward, 0, stream);
     if (status.ok()) {
-      binding_->prepare(view(model), batch, input, stream);
+      binding_->prepare(forward, stream);
     }
     return status;
   }
@@ -967,12 +1105,14 @@ class SlotBufferResultTest : public ::testing::Test {
       sampling.logprobs = logprobs;
       sampling.max_top_logprobs = top;
     }
-    const ModelInputBatch batch{
-        rows == 0 ? BatchForwardType::EMPTY : BatchForwardType::DECODE, rows};
-    Status status =
-        storage_->validate(view(input), batch, sampling, 0, *producer_);
+    auto forward = make_forward_input(
+        input,
+        rows == 0 ? BatchForwardType::EMPTY : BatchForwardType::DECODE,
+        rows);
+    forward.sampling_params = sampling;
+    Status status = storage_->validate(forward, 0, *producer_);
     if (status.ok()) {
-      storage_->prepare(view(input), batch, sampling, *producer_);
+      storage_->prepare(forward, *producer_);
     }
     return status;
   }

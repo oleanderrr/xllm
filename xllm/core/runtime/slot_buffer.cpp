@@ -27,6 +27,8 @@ limitations under the License.
 
 #include "core/layers/common/attention_metadata.h"
 #include "core/platform/platform.h"
+#include "core/runtime/forward_params.h"
+#include "core/util/tensor_helper.h"
 
 namespace xllm {
 namespace {
@@ -188,15 +190,31 @@ bool overlaps_host(std::span<const int32_t> source,
                        : base - start < source.size_bytes();
 }
 
+BatchInputMeta batch_input_meta(const ForwardInput& input) {
+  BatchInputMeta batch = input.input_params.meta;
+  // The builder leaves actual_num_sequences unset before Worker prepare.
+  if (batch.actual_num_sequences == 0) {
+    batch.actual_num_sequences = static_cast<int32_t>(
+        input.input_params.attention.host.q_seq_lens.size());
+  }
+  // ProfileManager uses this as an output marker. Slot execution remains eager;
+  // the pipeline preserves the caller's marker in its detached response.
+  batch.is_graph_warmup = false;
+  return batch;
+}
+
+}  // namespace
+
 // Called after validate_model; sizes and capacity are already checked.
-Status validate_batch(const ModelInputHostView& input,
-                      const ModelInputBatch& batch) {
+Status SlotBuffer::validate_batch(const ModelInputHostView& input,
+                                  const BatchInputMeta& batch) {
   const uint64_t rows = input.q_seq_lens.size();
-  if (batch.num_actual_sequences > rows) {
+  if (batch.actual_num_sequences < 0 ||
+      static_cast<uint64_t>(batch.actual_num_sequences) > rows) {
     return Status(StatusCode::INVALID_ARGUMENT,
                   "Invalid physical or actual model input rows.");
   }
-  switch (batch.forward_type.value()) {
+  switch (batch.batch_forward_type.value()) {
     case BatchForwardType::EMPTY:
       if (rows != 0) {
         return Status(StatusCode::INVALID_ARGUMENT,
@@ -212,19 +230,17 @@ Status validate_batch(const ModelInputHostView& input,
       return Status(StatusCode::INVALID_ARGUMENT,
                     "Unknown model input forward type.");
   }
-  if (rows == 0) {
-    return Status(StatusCode::INVALID_ARGUMENT,
-                  "Nonempty model input batch requires physical rows.");
-  }
-  for (uint32_t row = 0; row < batch.num_actual_sequences; ++row) {
+  // An empty logical shard inherits the active peer's forward type. Prepare
+  // materializes its padding row after validation, without an actual sequence.
+  for (int32_t row = 0; row < batch.actual_num_sequences; ++row) {
     if (input.q_seq_lens[row] <= 0 ||
-        (batch.forward_type.is_prefill() &&
+        (batch.batch_forward_type.is_prefill() &&
          input.kv_seq_lens[row] != input.q_seq_lens[row])) {
       return Status(StatusCode::INVALID_ARGUMENT,
                     "Invalid query or cache lengths for actual model rows.");
     }
   }
-  if (batch.forward_type.is_decode() &&
+  if (batch.batch_forward_type.is_decode() &&
       std::any_of(input.q_seq_lens.begin(),
                   input.q_seq_lens.end(),
                   [](int32_t length) { return length > 1; })) {
@@ -233,6 +249,8 @@ Status validate_batch(const ModelInputHostView& input,
   }
   return Status();
 }
+
+namespace {
 
 void assign_prefix(std::vector<int32_t>& output,
                    const torch::Tensor& staging,
@@ -630,9 +648,25 @@ Status SlotBuffer::validate_previous_tokens(const ModelInputHostView& model,
   return Status();
 }
 
-Status SlotBuffer::validate(const ModelInputHostView& model,
-                            const ModelInputBatch& batch,
-                            const SamplingParameters& sampling,
+SlotBuffer::ModelInputHostView SlotBuffer::model_input_view(
+    const ForwardInput& input) {
+  const auto& host = input.input_params.attention.host;
+  const auto tokens = int_span(input.host_token_ids());
+  return {tokens,
+          int_span(input.host_positions()),
+          host.new_cache_slots.empty()
+              ? int_span(input.input_params.attention.device.new_cache_slots)
+              : std::span<const int32_t>(host.new_cache_slots),
+          host.q_seq_lens,
+          host.kv_seq_lens,
+          host.q_cu_seq_lens,
+          int_span(host.block_tables),
+          tokens.empty()
+              ? 0
+              : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1))};
+}
+
+Status SlotBuffer::validate(const ForwardInput& input,
                             uint32_t previous_rows,
                             const Stream& stream) const {
   if (copy_submitted_) {
@@ -642,38 +676,51 @@ Status SlotBuffer::validate(const ModelInputHostView& model,
   if (stream.get_stream()->device_index() != device_.index()) {
     return invalid("Input stream and Slot device differ.");
   }
+  const ModelInputHostView model = model_input_view(input);
   Status status = validate_model(model);
   if (!status.ok()) {
     return status;
   }
-  status = validate_batch(model, batch);
+  status = validate_batch(model, batch_input_meta(input));
   if (!status.ok()) {
     return status;
   }
-  status = validate_sampling(sampling, model.token_ids.size());
+  status = validate_sampling(input.sampling_params, model.token_ids.size());
   if (!status.ok()) {
     return status;
   }
   return validate_previous_tokens(model, previous_rows);
 }
 
-void SlotBuffer::prepare(const ModelInputHostView& model,
-                         const ModelInputBatch& batch,
-                         const SamplingParameters& sampling,
-                         const Stream& stream) {
+void SlotBuffer::prepare(const ForwardInput& input, const Stream& stream) {
   CHECK(!copy_submitted_) << "Pending result prevents Slot reuse.";
-  // The caller validated all inputs before this first staging write. Mapping
-  // indices must be copied before metadata updates can invalidate borrowed
-  // spans.
+  const ModelInputHostView model = model_input_view(input);
+  const BatchInputMeta batch = batch_input_meta(input);
+  // The caller validated all inputs before this first staging write.
   auto guard = stream.set_stream_guard();
   prepare_previous_tokens(model);
-  prepare_model(model, batch);
-  prepare_sampling(sampling);
+  if (model.token_ids.empty() && !batch.batch_forward_type.is_empty()) {
+    const std::array<int32_t, 1> zero{0};
+    const std::array<int32_t, 1> one{1};
+    // Block zero is reserved for padding by the block manager. The inherited
+    // forward type joins peer collectives while actual_num_sequences stays
+    // zero.
+    prepare_model({one, zero, zero, one, one, one, zero, 1}, batch);
+  } else {
+    prepare_model(model, batch);
+  }
+  // Eager collectives only need logical token counts and phases. Copy into
+  // this Slot's retained vectors; graph/speculative summaries are unused.
+  auto& target = model_params_.parallel;
+  const auto& parallel = input.input_params.parallel;
+  target.dp_global_token_nums = parallel.dp_global_token_nums;
+  target.dp_is_decode = parallel.dp_is_decode;
+  prepare_sampling(input.sampling_params);
   prepare_result();
 }
 
 void SlotBuffer::prepare_model(const ModelInputHostView& input,
-                               const ModelInputBatch& batch) {
+                               const BatchInputMeta& batch) {
   const Layout& layout = layout_;
   const uint32_t token_count = static_cast<uint32_t>(input.token_ids.size());
   const uint32_t rows = static_cast<uint32_t>(input.q_seq_lens.size());
@@ -757,10 +804,9 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   attention.block_tables =
       device.block_tables.narrow(/*dim=*/0, /*start=*/0, rows);
 
-  model_params_.meta.batch_forward_type = batch.forward_type;
+  model_params_.meta.batch_forward_type = batch.batch_forward_type;
   model_params_.meta.num_sequences = static_cast<int32_t>(rows);
-  model_params_.meta.actual_num_sequences =
-      static_cast<int32_t>(batch.num_actual_sequences);
+  model_params_.meta.actual_num_sequences = batch.actual_num_sequences;
   model_params_.meta.batch_id = batch.batch_id;
   model_params_.meta.is_graph_warmup = batch.is_graph_warmup;
   model_params_.meta.q_max_seq_len = maximum(host.q_seq_lens);
@@ -775,7 +821,7 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   metadata.qo_indptr = attention.q_cu_seq_lens;
   metadata.slot_mapping = attention.new_cache_slots;
   metadata.block_table =
-      batch.forward_type.is_prefill() && !capacity_.enable_mla
+      batch.batch_forward_type.is_prefill() && !capacity_.enable_mla
           ? torch::Tensor()
           : attention.block_tables;
   metadata.q_seq_lens_vec.assign(host.q_seq_lens.begin(),
@@ -792,10 +838,10 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   metadata.max_seq_len = model_params_.meta.kv_max_seq_len;
   metadata.total_kv_len = std::accumulate(
       host.kv_seq_lens.begin(), host.kv_seq_lens.end(), int64_t{0});
-  metadata.is_prefill = batch.forward_type.is_prefill();
-  metadata.is_chunked_prefill =
-      batch.forward_type.is_chunked_prefill() || batch.forward_type.is_mixed();
-  metadata.is_mixed = batch.forward_type.is_mixed();
+  metadata.is_prefill = batch.batch_forward_type.is_prefill();
+  metadata.is_chunked_prefill = batch.batch_forward_type.is_chunked_prefill() ||
+                                batch.batch_forward_type.is_mixed();
+  metadata.is_mixed = batch.batch_forward_type.is_mixed();
   metadata.is_dummy = rows == 0;
 }
 

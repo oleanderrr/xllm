@@ -1943,6 +1943,9 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
   // existing contracts when staging directly into the Slot.
   capacity.parameter_dtype = options_.enable_shm() ? torch::kFloat32 : dtype_;
   capacity.enable_mla = args.enable_mla();
+  capacity.dp_size = parallel_args_.dp_size();
+  capacity.dp_rank = parallel_args_.rank() /
+                     (parallel_args_.world_size() / parallel_args_.dp_size());
   ::xllm::Status status = TaskExecutionPipeline::create(
       threadpool_, *model_, *model_executor_, kv_caches_, capacity, output);
   if (!status.ok()) {

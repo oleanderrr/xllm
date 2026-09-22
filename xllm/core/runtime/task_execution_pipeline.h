@@ -44,6 +44,8 @@ struct LlmTaskCapacity {
   uint32_t max_top_logprobs = 0;
   torch::ScalarType parameter_dtype = torch::kFloat32;
   bool enable_mla = false;
+  uint32_t dp_size = 1;
+  uint32_t dp_rank = 0;
 };
 
 struct TaskSubmission {
@@ -92,7 +94,8 @@ class TaskExecutionPipeline final {
 
  private:
   friend class TaskExecutionPipelineInputTest;
-  static Status validate_input(const ForwardInput& input);
+  static Status validate_input(const ForwardInput& input,
+                               const LlmTaskCapacity& capacity);
 
   struct Step {
     uint64_t id = 0;
@@ -123,10 +126,7 @@ class TaskExecutionPipeline final {
                         Executor& executor,
                         std::vector<KVCache>& kv_caches,
                         LlmTaskCapacity capacity);
-  Status validate(const Slot& slot,
-                  const ModelInputHostView& model,
-                  const ModelInputBatch& batch,
-                  const SamplingParameters& sampling) const;
+  Status validate(const Slot& slot, const ForwardInput& input) const;
   Status prepare(uint32_t slot_id, const ForwardInput& input);
   void launch(uint32_t slot_id);
   ForwardOutput consume(uint32_t slot_id);

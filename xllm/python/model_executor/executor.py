@@ -244,7 +244,7 @@ class ModelExecutor:
             and config.get("model_type") in ("qwen3", "glm_moe_dsa")
             and int(config.get("kv_split_size", 1)) in (0, 1)
             and graph_backend in ("", "off", "none", "0")
-            and all(int(config.get(key, 1)) == 1 for key in ("dp_size", "cp_size", "layerwise_split_size"))
+            and all(int(config.get(key, 1)) == 1 for key in ("cp_size", "layerwise_split_size"))
         )
         if dp_size > 1 and graph_backend not in (
             "",
