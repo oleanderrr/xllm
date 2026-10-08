@@ -153,6 +153,107 @@ class DsaAttentionBackend(AttentionBackend):
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         self._kv_caches = kv_caches
 
+    @property
+    def supports_prepared_metadata(self) -> bool:
+        return True
+
+    def prepare_metadata(self, metadata: AttentionMetadata) -> DsaMetadata:
+        """Build private Host state while another Slot may still be executing."""
+        expanded = getattr(metadata, "expanded_decode_metadata", None)
+        if (
+            getattr(metadata, "is_spec_verify", False)
+            or getattr(metadata, "has_kv_shard", False)
+            or (expanded is not None and expanded.enabled)
+        ):
+            raise ValueError("prepared DeepSeek-V4 metadata requires ordinary unsharded attention")
+        q_lens = metadata.q_seq_lens_host
+        kv_lens = metadata.kv_seq_lens_host
+        for lengths in (q_lens, kv_lens):
+            if lengths is None or lengths.device.type != "cpu" or lengths.dtype != torch.int32 or lengths.ndim != 1:
+                raise ValueError("prepared DeepSeek-V4 requires Host int32 sequence lengths")
+        if q_lens.numel() != kv_lens.numel():
+            raise ValueError("prepared DeepSeek-V4 query and KV lengths must match")
+        query_lengths = q_lens.tolist()
+        kv_lengths = kv_lens.tolist()
+        if any(q <= 0 or kv < q for q, kv in zip(query_lengths, kv_lengths)):
+            raise ValueError("prepared DeepSeek-V4 requires positive queries within the KV lengths")
+        tables = list(metadata.multi_block_tables)
+        if len(tables) != len(self.group_infos):
+            raise ValueError("prepared DeepSeek-V4 requires one block table per cache group")
+        for table in tables:
+            if (
+                table is None
+                or table.device.type != "cpu"
+                or table.dtype != torch.int32
+                or table.ndim != 2
+                or not table.is_contiguous()
+                or table.shape[0] != len(query_lengths)
+            ):
+                raise ValueError("prepared DeepSeek-V4 requires row-aligned Host int32 block tables")
+        self._validate_prepared_cache_tables(tables)
+        is_dummy = bool(getattr(metadata, "is_dummy", False))
+        if is_dummy:
+            dummy_kv_len = max(self.index_topk, self.window_size, 1)
+            kv_lengths = [dummy_kv_len] * len(query_lengths)
+            query_lengths = [1] * len(query_lengths)
+            tables = self._build_empty_dp_block_tables(
+                tables,
+                len(query_lengths),
+                dummy_kv_len,
+                torch.device("cpu"),
+                graph_mode=False,
+                graph_block_table_capacity_cols=0,
+            )
+        # Native Slots retain these Host tables until Consume. Keep each exact
+        # table width: the SWA writer uses it as the ring's modulo, whereas the
+        # compressed cache groups have independent physical block namespaces.
+        positions = torch.tensor(
+            [position for q, kv in zip(query_lengths, kv_lengths) for position in range(kv - q, kv)],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        prepared = self._builder.build(
+            multi_block_tables=tables,
+            kv_seq_lens=kv_lengths,
+            q_seq_lens=query_lengths,
+            positions=positions,
+            is_prefill=metadata.is_prefill and not is_dummy,
+            is_chunked_prefill=metadata.is_chunked_prefill,
+            new_cache_slots=getattr(metadata, "new_cache_slots_host_values", None),
+            max_query_len=int(metadata.max_query_len),
+            max_seq_len=int(metadata.max_seq_len),
+        )
+        for layer_slots in prepared.slot_mappings:
+            if any(bool(slots.lt(0).any()) for slots in layer_slots):
+                raise ValueError("prepared DeepSeek-V4 block tables do not cover the current KV writes")
+        return prepared
+
+    def _validate_prepared_cache_tables(self, tables: list[torch.Tensor]) -> None:
+        if len(self._kv_caches) != len(self.caches_info):
+            raise ValueError("prepared DeepSeek-V4 requires bound caches for every layer")
+        bounds = [(int(table.min()), int(table.max())) if table.numel() else (-1, -1) for table in tables]
+        for layer_id, layer_cache in enumerate(self._kv_caches):
+            mapping = self._resolve_cache_mapping(layer_id, self._layer_compress_ratio(layer_id))
+            cache_fields = (
+                (mapping.ori_cache_idx, layer_cache.swa),
+                (mapping.cmp_cache_idx, layer_cache.key),
+                (mapping.index_cache_idx, layer_cache.index),
+                (mapping.kv_state_cache_idx, layer_cache.compress_kv_state),
+                (mapping.score_state_cache_idx, layer_cache.compress_score_state),
+                (mapping.index_kv_state_cache_idx, layer_cache.compress_index_kv_state),
+                (mapping.index_score_state_cache_idx, layer_cache.compress_index_score_state),
+                (mapping.indexer_scale_cache_idx, layer_cache.indexer_scale),
+            )
+            for cache_index, cache in cache_fields:
+                if cache_index < 0:
+                    continue
+                if cache is None or cache.ndim == 0 or cache.shape[0] <= 0:
+                    raise ValueError("prepared DeepSeek-V4 requires allocated grouped KV caches")
+                group_id = self.caches_info[layer_id][cache_index].group_id
+                minimum, maximum = bounds[group_id]
+                if minimum < -1 or maximum >= cache.shape[0]:
+                    raise ValueError("prepared DeepSeek-V4 page index is outside its allocated cache group")
+
     def _current_forward_metadata(self) -> AttentionMetadata:
         try:
             return get_forward_context().metadata
@@ -217,6 +318,16 @@ class DsaAttentionBackend(AttentionBackend):
         metadata: AttentionMetadata,
     ) -> DsaMetadata:
         """Build one request's complete DSA metadata without publishing it."""
+        prepared = getattr(metadata, "prepared_attention_state", None)
+        if prepared is not None:
+            if not isinstance(prepared, DsaMetadata):
+                raise ValueError("prepared DeepSeek-V4 metadata has an incompatible attention state")
+            positions = getattr(metadata, "dsa_positions", None)
+            if positions is None or positions.numel() != prepared.input_positions.numel():
+                raise ValueError("prepared DeepSeek-V4 requires current positions for every query token")
+            prepared.input_positions = positions
+            self._prepare_dsa_metadata_for_device(prepared, metadata)
+            return prepared
         # MTP draft layers consume only a prefix of the target cache managers.
         multi_block_tables = metadata.multi_block_tables[: len(self.group_infos)]
         max_query_len = int(getattr(metadata, "max_query_len", 0))
@@ -279,6 +390,15 @@ class DsaAttentionBackend(AttentionBackend):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
         )
+        self._prepare_dsa_metadata_for_device(compressed_metadata, metadata)
+        return compressed_metadata
+
+    def _prepare_dsa_metadata_for_device(
+        self,
+        compressed_metadata: DsaMetadata,
+        metadata: AttentionMetadata,
+    ) -> None:
+        """Complete prepared and eager metadata with the same current-forward state."""
         # Synthetic warmup metadata may omit rotary caches.
         if getattr(metadata, "dsa_cos_sin", None) is not None and metadata.dsa_cos_sin.numel() > 0:
             compressed_metadata.input_rope_by_ratio = self._build_dsa_rope_metadata(compressed_metadata, metadata)
@@ -286,7 +406,6 @@ class DsaAttentionBackend(AttentionBackend):
             self._populate_compressed_attention_rope(compressed_metadata, metadata)
         self._move_metadata_to_device(compressed_metadata)
         self._build_precomputed_metadata(compressed_metadata)
-        return compressed_metadata
 
     def _build_empty_dp_block_tables(
         self,

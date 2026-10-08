@@ -32,6 +32,8 @@ struct ModelInputCapacity {
   uint32_t max_tokens = 0;
   uint32_t max_sequences = 0;
   uint32_t max_blocks_per_sequence = 0;
+  bool enable_linear_attention = false;
+  uint32_t num_block_managers = 0;
 };
 
 // Borrowed CPU model data used by ordinary Slots and speculative invocations.
@@ -44,6 +46,7 @@ struct ModelInputHostView {
   std::span<const int32_t> q_cu_seq_lens;
   std::span<const int32_t> block_tables;
   uint32_t block_table_width = 0;
+  bool grouped_kv = false;
 };
 
 struct ModelInputBatch {
@@ -288,6 +291,8 @@ class SlotBuffer final {
     Region kv_seq_lens;
     Region q_cu_seq_lens;
     Region block_tables;
+    Region linear_state_indices;
+    Region query_start_loc;
     uint64_t block_table_row_stride_bytes = 0;
     uint64_t total_bytes = 0;
   };
@@ -299,6 +304,8 @@ class SlotBuffer final {
     torch::Tensor kv_seq_lens;
     torch::Tensor q_cu_seq_lens;
     torch::Tensor block_tables;
+    torch::Tensor linear_state_indices;
+    torch::Tensor query_start_loc;
   };
 
   SlotBuffer(SlotBufferCapacity capacity,
@@ -317,6 +324,8 @@ class SlotBuffer final {
   static Status validate_batch(const ModelInputHostView& model,
                                const BatchInputMeta& batch);
   Status validate_model(const ModelInputHostView& model) const;
+  Status validate_model_state(const LlmForwardInput& input) const;
+  void prepare_model_state(const LlmForwardInput& input);
   Status validate_previous_tokens(const ModelInputHostView& model,
                                   uint32_t previous_rows) const;
   void prepare_model(const ModelInputHostView& model,
@@ -333,6 +342,10 @@ class SlotBuffer final {
   torch::Tensor device_buffer_;
   ModelTensors model_host_;
   ModelTensors model_device_;
+  std::vector<torch::Tensor> multi_block_table_storage_;
+  torch::Tensor initial_states_host_;
+  torch::Tensor initial_states_device_;
+  uint64_t model_state_host_bytes_ = 0;
   LlmModelParams native_model_params_;
   ModelInputParams model_params_{native_model_params_};
   torch::Tensor tokens_;

@@ -1882,13 +1882,102 @@ def test_executor_rejects_unsupported_prepared_metadata(unsupported: dict[str, o
         executor = ModelExecutor(_FakeModel(), {"model_type": "qwen3", **unsupported}, max_seqs_per_batch=2)
     assert not executor.supports_prepared_metadata
     metadata = SimpleNamespace(q_cu_seq_lens_host_values=[1, 2])
-    with pytest.raises(RuntimeError, match="supported Qwen3 or GLM"):
+    with pytest.raises(RuntimeError, match="supported model executor"):
         executor.prepare_metadata(metadata)
     assert not hasattr(metadata, "prepared_attention_state")
     assert not backend._prepared
 
 
-@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"])
+def test_prepared_qwen35_validates_recurrent_views_before_preparing_backend(model_type: str) -> None:
+    backend = _PreparedStubAttentionBackend()
+    model = _FakeModel()
+    model.layers[0].layer_type = "linear_attention"
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(model, {"model_type": model_type}, max_seqs_per_batch=2)
+    assert executor.supports_prepared_metadata
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = SimpleNamespace(
+        q_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([0, 3, 5], dtype=torch.int32),
+        q_cu_seq_lens_host_values=[3, 5],
+        linear_state_indices=torch.tensor([3, 1], dtype=torch.int32),
+        has_initial_state=torch.tensor([False, True]),
+    )
+    for name, invalid in (
+        ("linear_state_indices", None),
+        ("linear_state_indices", torch.zeros(2, dtype=torch.int64)),
+        ("has_initial_state", torch.zeros(2, dtype=torch.int32)),
+        ("q_cu_seq_lens", torch.tensor([3, 5], dtype=torch.int32)),
+    ):
+        valid = getattr(metadata, name)
+        setattr(metadata, name, invalid)
+        with pytest.raises(ValueError, match=name):
+            executor.prepare_metadata(metadata)
+        assert not hasattr(metadata, "prepared_attention_state")
+        setattr(metadata, name, valid)
+    executor.prepare_metadata(metadata)
+    assert metadata.prepared_attention_state.source == [3, 5]
+    assert not backend._prepared
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+def test_prepared_qwen35_full_attention_does_not_require_recurrent_views(model_type: str) -> None:
+    backend = _PreparedStubAttentionBackend()
+    model = _FakeModel()
+    for layer in model.layers:
+        layer.layer_type = "full_attention"
+    config = {"model_type": model_type, "full_attention_interval": 1}
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(model, config, max_seqs_per_batch=2)
+    assert executor.supports_prepared_metadata
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = SimpleNamespace(
+        q_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+        q_cu_seq_lens_host_values=[3, 5],
+        linear_state_indices=None,
+        has_initial_state=None,
+    )
+    executor.prepare_metadata(metadata)
+    assert metadata.prepared_attention_state.source == [3, 5]
+    assert not backend._prepared
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "deepseek_v32", "deepseek_v4"])
+@pytest.mark.parametrize(
+    "overrides,decode_width",
+    [({"num_speculative_tokens": 2}, 1), ({"is_draft_engine": True}, 1), ({}, 2)],
+)
+def test_new_prepared_models_require_ordinary_generation(
+    model_type: str, overrides: dict[str, object], decode_width: int
+) -> None:
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(
+            _FakeModel(),
+            {"model_type": model_type, **overrides},
+            max_seqs_per_batch=2,
+            num_decoding_tokens=decode_width,
+        )
+    assert not executor.supports_prepared_metadata
+
+
+def test_prepared_deepseek_v4_requires_eager_execution() -> None:
+    config = {"model_type": "deepseek_v4", "enable_task_pipeline": True}
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
+        assert executor.supports_prepared_metadata
+        with pytest.raises(ValueError, match="prepared ACL graphs"):
+            ModelExecutor(_FakeModel(), {**config, "python_graph_backend": "aclgraph"}, max_seqs_per_batch=2)
+
+
+@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa", "deepseek_v32"])
 @pytest.mark.parametrize(
     "tp,rank,ep,moe_tp",
     [(1, 0, 1, 1), (2, 0, 1, 2), (2, 1, 1, 2), (2, 1, 2, 1), (16, 15, 16, 1), (16, 15, 1, 16)],
@@ -2127,7 +2216,7 @@ def test_kv_transfer_uses_eager_and_preserves_step_inputs(prepared: bool, is_mtp
         runner.execute.assert_not_called()
 
 
-@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
+@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa", "deepseek_v32"])
 def test_executor_accepts_prepared_data_parallel(model_type: str) -> None:
     config = {"model_type": model_type, "dp_size": 2, "dp_rank": 1, "graph_backend": "off"}
     with patch(
@@ -2256,7 +2345,7 @@ def test_speculative_target_graph_capacity_expands_validation_tokens(dp_size: in
     assert executor.decode_graph_runner is None
 
 
-@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
+@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa", "deepseek_v32"])
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("pipeline", [False, True])
 def test_executor_selects_acl_graph_input_owner(model_type: str, dp_size: int, pipeline: bool) -> None:

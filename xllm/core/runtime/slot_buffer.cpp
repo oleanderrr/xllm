@@ -24,6 +24,7 @@ limitations under the License.
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 #include "core/layers/common/attention_metadata.h"
 #include "core/platform/platform.h"
@@ -326,6 +327,12 @@ bool cpu_indices(const torch::Tensor& tensor) {
          tensor.is_contiguous();
 }
 
+std::span<const int32_t> linear_ids(const LlmModelParams& params) {
+  return params.embedding.linear_state_ids.empty()
+             ? int_span(params.embedding.linear_state_indices)
+             : std::span<const int32_t>(params.embedding.linear_state_ids);
+}
+
 void copy_to_device(const torch::Tensor& destination,
                     const torch::Tensor& source,
                     const Stream& stream) {
@@ -437,6 +444,22 @@ Status SlotBuffer::make_layout(const ModelInputCapacity& capacity,
     return Status(StatusCode::INVALID_ARGUMENT,
                   "Model input layout exceeds signed 64-bit tensor capacity.");
   }
+  if (capacity.enable_linear_attention &&
+      (!append_region(capacity.max_sequences,
+                      planned.linear_state_indices,
+                      planned.total_bytes) ||
+       !append_region(static_cast<uint64_t>(capacity.max_sequences) + 1,
+                      planned.query_start_loc,
+                      planned.total_bytes))) {
+    return invalid("Linear-state input exceeds tensor capacity.");
+  }
+  // Grouped tables stay on the Host; their exact widths define circular KV
+  // addressing. Validate the complete fixed storage budget before allocation.
+  if (capacity.num_block_managers > 3 ||
+      block_elements > kMaxTensorBytes / sizeof(int32_t) /
+                           std::max<uint32_t>(1, capacity.num_block_managers)) {
+    return invalid("Grouped KV input exceeds tensor capacity.");
+  }
   layout = planned;
   return Status();
 }
@@ -460,6 +483,11 @@ SlotBuffer::ModelTensors SlotBuffer::bind_views(const torch::Tensor& buffer,
   views.block_tables = field_view(buffer, layout.block_tables)
                            .view({layout.capacity.max_sequences,
                                   layout.capacity.max_blocks_per_sequence});
+  if (layout.capacity.enable_linear_attention) {
+    views.linear_state_indices =
+        field_view(buffer, layout.linear_state_indices);
+    views.query_start_loc = field_view(buffer, layout.query_start_loc);
+  }
   return views;
 }
 
@@ -581,6 +609,31 @@ SlotBuffer::SlotBuffer(SlotBufferCapacity capacity,
            0);
   model_host_ = bind_views(host_buffer_, layout_);
   model_device_ = bind_views(device_buffer_, layout_);
+  multi_block_table_storage_.reserve(capacity.model.num_block_managers);
+  model_params_.multi_block_tables.reserve(capacity.model.num_block_managers);
+  for (uint32_t manager = 0; manager < capacity.model.num_block_managers;
+       ++manager) {
+    auto storage =
+        torch::empty({static_cast<int64_t>(capacity.model.max_sequences) *
+                      capacity.model.max_blocks_per_sequence},
+                     host_buffer_.options().pinned_memory(true));
+    model_state_host_bytes_ += storage.nbytes();
+    multi_block_table_storage_.emplace_back(std::move(storage));
+  }
+  if (capacity.model.enable_linear_attention) {
+    initial_states_host_ = torch::empty(
+        {capacity.model.max_sequences},
+        host_buffer_.options().dtype(torch::kBool).pinned_memory(true));
+    initial_states_device_ =
+        torch::empty({capacity.model.max_sequences},
+                     device_buffer_.options().dtype(torch::kBool));
+    model_state_host_bytes_ += initial_states_host_.nbytes();
+    model_params_.embedding.linear_state_ids.reserve(
+        capacity.model.max_sequences);
+    model_params_.linear_state_cache_ops.reserve(capacity.model.max_sequences);
+    model_params_.linear_state_validity_mask.reserve(
+        capacity.model.max_sequences);
+  }
 
   AttentionHostInputView& host = model_params_.attention.host;
   for (std::vector<int32_t>* lengths : {&host.q_seq_lens,
@@ -605,11 +658,14 @@ Status SlotBuffer::validate_model(const ModelInputHostView& input) const {
       tokens > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
       input.block_table_width > capacity.max_blocks_per_sequence ||
       input.positions.size() != tokens ||
-      input.new_cache_slots.size() != tokens ||
+      (input.new_cache_slots.size() != tokens &&
+       (!input.grouped_kv || !input.new_cache_slots.empty())) ||
+      (input.grouped_kv && capacity.num_block_managers == 0) ||
       input.kv_seq_lens.size() != rows || input.q_cu_seq_lens.size() != rows ||
       input.block_tables.size() != rows * input.block_table_width ||
       (rows == 0 && (tokens != 0 || input.block_table_width != 0)) ||
-      (rows != 0 && (tokens == 0 || input.block_table_width == 0))) {
+      (rows != 0 &&
+       (tokens == 0 || (!input.grouped_kv && input.block_table_width == 0)))) {
     return Status(StatusCode::INVALID_ARGUMENT,
                   "Invalid model input sizes or capacity.");
   }
@@ -793,9 +849,86 @@ ModelInputHostView SlotBuffer::model_input_view(const LlmForwardInput& input) {
           host.kv_seq_lens,
           host.q_cu_seq_lens,
           int_span(host.block_tables),
-          tokens.empty()
+          tokens.empty() || !host.block_tables.defined()
               ? 0
-              : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1))};
+              : static_cast<uint32_t>(host.block_tables.size(/*dim=*/1)),
+          !input.input_params.multi_block_tables.empty()};
+}
+
+Status SlotBuffer::validate_model_state(const LlmForwardInput& input) const {
+  const auto& params = input.input_params;
+  const uint64_t rows = params.attention.host.q_seq_lens.size();
+  const auto& tables = params.multi_block_tables;
+  if ((!tables.empty() || rows != 0) &&
+      tables.size() != capacity_.model.num_block_managers) {
+    return invalid("Grouped KV manager count differs from the model contract.");
+  }
+  for (const auto& table : tables) {
+    if (!table.defined() || !table.device().is_cpu() ||
+        table.scalar_type() != torch::kInt32 || table.dim() != 2 ||
+        !table.is_contiguous() || table.size(0) != rows || table.size(1) <= 0 ||
+        table.size(1) > capacity_.model.max_blocks_per_sequence ||
+        !all_values<int32_t>(table,
+                             [](int32_t value) { return value >= -1; })) {
+      return invalid("Invalid grouped KV page table.");
+    }
+    for (const auto& storage : multi_block_table_storage_) {
+      if (overlaps_host(int_span(table), storage)) {
+        return invalid("Grouped KV input aliases destination staging storage.");
+      }
+    }
+  }
+  if (!capacity_.model.enable_linear_attention) {
+    return Status();
+  }
+  const auto& indices = params.embedding.linear_state_indices;
+  if (indices.defined() && (!cpu_indices(indices) || indices.numel() != rows)) {
+    return invalid("Linear-state indices must be row-aligned CPU int32.");
+  }
+  const auto ids = linear_ids(params);
+  if (overlaps_host(ids, host_buffer_)) {
+    return invalid("Linear-state input aliases destination staging storage.");
+  }
+  if (!ids.empty() && ids.size() != rows) {
+    return invalid("Linear-state IDs must be row-aligned.");
+  }
+  if (!params.embedding.linear_state_ids.empty() && indices.defined() &&
+      !std::equal(ids.begin(), ids.end(), indices.data_ptr<int32_t>())) {
+    return invalid("Linear-state IDs and indices disagree.");
+  }
+  const auto& ops = params.linear_state_cache_ops;
+  const auto& validity = params.linear_state_validity_mask;
+  if ((!ops.empty() && ops.size() != rows) ||
+      (!validity.empty() && validity.size() != rows) ||
+      std::any_of(validity.begin(), validity.end(), [](int64_t value) {
+        return value != 0 && value != 1;
+      })) {
+    return invalid("Linear-state operations and validity must be row-aligned.");
+  }
+  if (params.meta.is_graph_warmup) {
+    return Status();
+  }
+  if (ids.size() != rows) {
+    return invalid("Active linear attention requires one state ID per row.");
+  }
+  std::unordered_set<int32_t> active_ids;
+  active_ids.reserve(rows);
+  for (uint64_t row = 0; row < rows; ++row) {
+    if (ids[row] <= 0 || !active_ids.insert(ids[row]).second) {
+      return invalid("Linear-state rows require unique non-padding IDs.");
+    }
+    if (ops.empty()) {
+      continue;
+    }
+    const auto& op = ops[row];
+    if (op.linear_state_id != ids[row] ||
+        (op.reset_requested && op.restore_requested) ||
+        (op.restore_requested ? op.restore_src_slot_id <= 0
+                              : op.restore_src_slot_id >= 0)) {
+      return invalid("Invalid linear-state reset/restore operation.");
+    }
+  }
+  return Status();
 }
 
 Status SlotBuffer::validate(const LlmForwardInput& input,
@@ -814,6 +947,10 @@ Status SlotBuffer::validate(const LlmForwardInput& input,
     return status;
   }
   status = validate_batch(model, batch_input_meta(input));
+  if (!status.ok()) {
+    return status;
+  }
+  status = validate_model_state(input);
   if (!status.ok()) {
     return status;
   }
@@ -854,6 +991,7 @@ void SlotBuffer::prepare(const LlmForwardInput& input,
     prepare_model(model, batch);
   }
   model_params_.enable_graph = padded_batch_size != 0;
+  prepare_model_state(input);
   // Graph collectives use common physical rows; keep logical counts separate.
   auto& target = model_params_.parallel;
   const auto& parallel = input.input_params.parallel;
@@ -901,7 +1039,7 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
       continue;
     }
     const uint64_t offset = regions[i].offset / sizeof(int32_t);
-    if (padded_batch_size != 0) {
+    if (padded_batch_size != 0 || (input.grouped_kv && i == 2)) {
       // Padding uses reserved block zero and never writes live KV slots.
       const int32_t padding = i == 2 ? -1 : (i == 1 ? 0 : 1);
       std::fill_n(host_data + offset, count, padding);
@@ -927,7 +1065,7 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
       std::memcpy(host_data + offset, input.block_tables.data(), bytes);
     } else {
       std::memset(host_data + offset, 0, bytes);
-      for (uint32_t row = 0; row < actual_rows; ++row) {
+      for (uint32_t row = 0; width != 0 && row < actual_rows; ++row) {
         std::memcpy(host_data + offset +
                         static_cast<uint64_t>(row) *
                             layout.capacity.max_blocks_per_sequence,
@@ -949,7 +1087,13 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   assign_prefix(host.q_seq_lens, staging.q_seq_lens, rows);
   assign_prefix(host.q_cu_seq_lens, staging.q_cu_seq_lens, rows);
   assign_prefix(host.kv_seq_lens, staging.kv_seq_lens, rows);
-  assign_prefix(host.new_cache_slots, staging.new_cache_slots, token_count);
+  if (input.grouped_kv && input.new_cache_slots.empty()) {
+    // Absence lets grouped attention derive SWA slots from its page tables.
+    // Device padding sentinels are not an explicit Host slot mapping.
+    host.new_cache_slots.clear();
+  } else {
+    assign_prefix(host.new_cache_slots, staging.new_cache_slots, token_count);
+  }
   host.kv_cache_tokens_nums.resize(rows);
   for (uint32_t row = 0; row < rows; ++row) {
     host.kv_cache_tokens_nums[row] =
@@ -1011,7 +1155,81 @@ void SlotBuffer::prepare_model(const ModelInputHostView& input,
   metadata.is_chunked_prefill = batch.batch_forward_type.is_chunked_prefill() ||
                                 batch.batch_forward_type.is_mixed();
   metadata.is_mixed = batch.batch_forward_type.is_mixed();
-  metadata.is_dummy = rows == 0;
+  metadata.is_dummy = batch.actual_num_sequences == 0;
+}
+
+void SlotBuffer::prepare_model_state(const LlmForwardInput& input) {
+  auto& params = model_params_;
+  const auto& source = input.input_params;
+  const uint32_t rows = params.meta.num_sequences;
+  const uint32_t actual_rows = source.attention.host.q_seq_lens.size();
+  params.multi_block_tables.clear();
+  for (uint32_t manager = 0; manager < capacity_.model.num_block_managers;
+       ++manager) {
+    const auto& storage = multi_block_table_storage_[manager];
+    const bool empty = actual_rows == 0;
+    const uint32_t width =
+        empty ? 1 : source.multi_block_tables[manager].size(1);
+    auto table = storage.narrow(0, 0, static_cast<int64_t>(rows) * width)
+                     .view({rows, width});
+    table.zero_();
+    if (!empty) {
+      table.narrow(0, 0, actual_rows).copy_(source.multi_block_tables[manager]);
+    }
+    params.multi_block_tables.emplace_back(std::move(table));
+  }
+  if (!capacity_.model.enable_linear_attention) {
+    return;
+  }
+  const bool warmup = source.meta.is_graph_warmup;
+  auto ids = model_host_.linear_state_indices.narrow(0, 0, rows);
+  ids.zero_();
+  const auto source_ids = linear_ids(source);
+  if (!warmup && actual_rows != 0) {
+    std::memcpy(
+        ids.data_ptr<int32_t>(), source_ids.data(), source_ids.size_bytes());
+  }
+  assign_prefix(params.embedding.linear_state_ids, ids, rows);
+  params.embedding.linear_state_indices =
+      model_device_.linear_state_indices.narrow(0, 0, rows);
+  params.embedding.linear_state_indices.copy_(ids, /*non_blocking=*/true);
+  if (warmup) {
+    params.linear_state_cache_ops.clear();
+  } else {
+    params.linear_state_cache_ops.assign(source.linear_state_cache_ops.begin(),
+                                         source.linear_state_cache_ops.end());
+  }
+  params.linear_state_validity_mask.assign(actual_rows, 0);
+  bool* initial = initial_states_host_.data_ptr<bool>();
+  for (uint32_t row = 0; row < rows; ++row) {
+    bool valid = !warmup && row < actual_rows &&
+                 params.attention.host.kv_cache_tokens_nums[row] > 0;
+    if (!warmup && row < source.linear_state_validity_mask.size()) {
+      valid = source.linear_state_validity_mask[row] != 0;
+    }
+    if (!warmup && row < source.linear_state_cache_ops.size()) {
+      const auto& op = source.linear_state_cache_ops[row];
+      valid = op.restore_requested || (valid && !op.reset_requested);
+    }
+    initial[row] = valid;
+    if (row < actual_rows) {
+      params.linear_state_validity_mask[row] = valid;
+    }
+  }
+  params.attn_metadata->has_initial_states =
+      initial_states_device_.narrow(0, 0, rows);
+  params.attn_metadata->has_initial_states.copy_(
+      initial_states_host_.narrow(0, 0, rows), /*non_blocking=*/true);
+  auto query_starts = model_host_.query_start_loc.narrow(0, 0, rows + 1);
+  int32_t* starts = query_starts.data_ptr<int32_t>();
+  starts[0] = 0;
+  std::copy(params.attention.host.q_cu_seq_lens.begin(),
+            params.attention.host.q_cu_seq_lens.end(),
+            starts + 1);
+  params.attn_metadata->q_cu_seq_lens =
+      model_device_.query_start_loc.narrow(0, 0, rows + 1);
+  params.attn_metadata->q_cu_seq_lens.copy_(query_starts,
+                                            /*non_blocking=*/true);
 }
 
 Status SlotBuffer::prepare_sampling(const SamplingParameters& input,
@@ -1277,14 +1495,16 @@ void SlotBuffer::discard_result() {
 
 uint64_t SlotBuffer::pinned_bytes() const {
   uint64_t bytes = (host_buffer_.defined() ? host_buffer_.nbytes() : 0) +
-                   auxiliary_bytes_ +
+                   model_state_host_bytes_ + auxiliary_bytes_ +
                    (host_indices_.defined() ? host_indices_.nbytes() : 0);
   bytes += input_scratch_ ? input_scratch_->pinned_bytes_ : 0;
   return bytes;
 }
 uint64_t SlotBuffer::device_bytes() const {
-  uint64_t bytes = (device_buffer_.defined() ? device_buffer_.nbytes() : 0) +
-                   auxiliary_bytes_;
+  uint64_t bytes =
+      (device_buffer_.defined() ? device_buffer_.nbytes() : 0) +
+      (initial_states_device_.defined() ? initial_states_device_.nbytes() : 0) +
+      auxiliary_bytes_;
   for (const auto* tensor :
        {&device_indices_, &gathered_int64_, &gathered_int32_}) {
     bytes += tensor->defined() ? tensor->nbytes() : 0;

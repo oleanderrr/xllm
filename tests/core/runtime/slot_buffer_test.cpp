@@ -170,6 +170,245 @@ class SlotBufferTest : public ::testing::Test {
   std::unique_ptr<Stream> consumer_;
 };
 
+class GroupedSlotBufferTest : public SlotBufferTest {
+ protected:
+  void SetUp() override {
+    capacity_.model.num_block_managers = 3;
+    SlotBufferTest::SetUp();
+  }
+
+  static LlmForwardInput grouped_input() {
+    InputData data = make_input({1, 1}, {9, 13});
+    data.positions = {8, 12};
+    data.slots.clear();
+    data.blocks.clear();
+    data.width = 0;
+    auto input = make_forward_input(data,
+                                    BatchForwardType::DECODE,
+                                    /*actual_rows=*/2,
+                                    /*batch_id=*/91);
+    input.input_params.multi_block_tables = {
+        torch::tensor({3, 4, 5, -1}, torch::kInt32).reshape({2, 2}),
+        torch::tensor({8, 9}, torch::kInt32).reshape({2, 1}),
+        torch::tensor({11, 12, 13, 14, 15, -1}, torch::kInt32).reshape({2, 3})};
+    return input;
+  }
+
+  static std::vector<torch::Tensor> clone_tables(const SlotBuffer& buffer) {
+    const auto& tables = buffer.model_params().multi_block_tables;
+    std::vector<torch::Tensor> snapshots;
+    snapshots.reserve(tables.size());
+    for (const auto& table : tables) {
+      snapshots.emplace_back(table.clone());
+    }
+    return snapshots;
+  }
+
+  static void expect_tables(const SlotBuffer& buffer,
+                            const std::vector<torch::Tensor>& expected) {
+    const auto& tables = buffer.model_params().multi_block_tables;
+    ASSERT_EQ(tables.size(), expected.size());
+    for (uint32_t manager = 0; manager < tables.size(); ++manager) {
+      const auto& table = tables[manager];
+      EXPECT_TRUE(table.device().is_cpu());
+      EXPECT_EQ(table.scalar_type(), torch::kInt32);
+      EXPECT_TRUE(table.is_contiguous());
+      EXPECT_EQ(table.sizes(), expected[manager].sizes());
+      EXPECT_TRUE(torch::equal(table, expected[manager]));
+    }
+  }
+};
+
+TEST_F(GroupedSlotBufferTest, PreservesExactManagerWidthsAndPadding) {
+  const auto input = grouped_input();
+  ASSERT_FALSE(input.input_params.attention.host.block_tables.defined());
+  ASSERT_TRUE(input.input_params.attention.host.new_cache_slots.empty());
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  expect_tables(*binding_, input.input_params.multi_block_tables);
+  EXPECT_TRUE(binding_->model_params().attention.host.new_cache_slots.empty());
+  EXPECT_FALSE(binding_->model_params().attn_metadata->is_dummy);
+  for (uint32_t manager = 0; manager < 3; ++manager) {
+    EXPECT_NE(binding_->model_params().multi_block_tables[manager].data_ptr(),
+              input.input_params.multi_block_tables[manager].data_ptr());
+  }
+  EXPECT_TRUE(torch::equal(
+      binding_->model_params().attention.device.new_cache_slots.cpu(),
+      torch::full({2}, -1, torch::kInt32)));
+  EXPECT_EQ(binding_->model_params()
+                .attention.device.block_tables.cpu()
+                .count_nonzero()
+                .item<int64_t>(),
+            0);
+  EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 2);
+  EXPECT_EQ(binding_->model_params().attention.host.kv_cache_tokens_nums,
+            (std::vector<int32_t>{8, 12}));
+}
+
+TEST_F(GroupedSlotBufferTest, PreservesExplicitSwaSlotsAndClearsAbsentMapping) {
+  auto input = grouped_input();
+  input.input_params.attention.host.new_cache_slots = {24, 36};
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  input.input_params.attention.host.new_cache_slots.assign(2, 99);
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  EXPECT_EQ(binding_->model_params().attention.host.new_cache_slots,
+            (std::vector<int32_t>{24, 36}));
+  EXPECT_TRUE(torch::equal(
+      binding_->model_params().attention.device.new_cache_slots.cpu(),
+      torch::tensor({24, 36}, torch::kInt32)));
+
+  ASSERT_TRUE(prepare_model(grouped_input(), *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  EXPECT_TRUE(binding_->model_params().attention.host.new_cache_slots.empty());
+  EXPECT_TRUE(torch::equal(
+      binding_->model_params().attention.device.new_cache_slots.cpu(),
+      torch::full({2}, -1, torch::kInt32)));
+}
+
+TEST_F(GroupedSlotBufferTest,
+       HostTablesArePrivateAcrossSlotsAndCallerOverwrite) {
+  std::unique_ptr<SlotBuffer> second;
+  ASSERT_TRUE(SlotBuffer::create(capacity_, device_, second).ok());
+  auto input = grouped_input();
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  const auto first_tables = clone_tables(*binding_);
+  const uint64_t pinned_bytes = binding_->pinned_bytes();
+  for (auto& table : input.input_params.multi_block_tables) {
+    table.fill_(21);
+  }
+  ASSERT_TRUE(second->validate(input, /*previous_rows=*/0, *transfer_).ok());
+  second->prepare(input, *transfer_);
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  expect_tables(*binding_, first_tables);
+  expect_tables(*second, input.input_params.multi_block_tables);
+  const auto second_tables = clone_tables(*second);
+  for (uint32_t manager = 0; manager < 3; ++manager) {
+    EXPECT_NE(binding_->model_params().multi_block_tables[manager].data_ptr(),
+              second->model_params().multi_block_tables[manager].data_ptr());
+  }
+  input.input_params.multi_block_tables = {
+      torch::tensor({31, 32}, torch::kInt32).reshape({2, 1}),
+      torch::tensor({33, -1, 34, 35}, torch::kInt32).reshape({2, 2}),
+      torch::tensor({36, 37}, torch::kInt32).reshape({2, 1})};
+  ASSERT_TRUE(prepare_model(input, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  expect_tables(*binding_, input.input_params.multi_block_tables);
+  expect_tables(*second, second_tables);
+  EXPECT_EQ(binding_->pinned_bytes(), pinned_bytes);
+}
+
+TEST_F(GroupedSlotBufferTest, EmptyDpPeerUsesReservedBlocksAndClearsOldGroups) {
+  ASSERT_TRUE(prepare_model(grouped_input(), *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  const uint64_t pinned_bytes = binding_->pinned_bytes();
+  std::array<const void*, 3> addresses;
+  for (uint32_t manager = 0; manager < addresses.size(); ++manager) {
+    addresses[manager] =
+        binding_->model_params().multi_block_tables[manager].data_ptr();
+  }
+  for (const BatchForwardType type : {BatchForwardType::PREFILL,
+                                      BatchForwardType::CHUNKED_PREFILL,
+                                      BatchForwardType::DECODE,
+                                      BatchForwardType::MIXED}) {
+    auto empty = make_forward_input({}, type, /*actual_rows=*/0);
+    empty.input_params.parallel.dp_global_token_nums = {0, 2};
+    empty.input_params.parallel.dp_is_decode = {0, type.is_decode() ? 1 : 0};
+    ASSERT_TRUE(prepare_model(empty, *transfer_).ok());
+    ASSERT_EQ(transfer_->synchronize(), 0);
+    EXPECT_EQ(binding_->model_params().meta.actual_num_sequences, 0);
+    EXPECT_EQ(binding_->model_params().meta.num_sequences, 1);
+    EXPECT_TRUE(binding_->model_params().attn_metadata->is_dummy);
+    EXPECT_EQ(binding_->model_params().attention.host.q_seq_lens,
+              (std::vector<int32_t>{1}));
+    EXPECT_EQ(binding_->model_params().attention.host.kv_seq_lens,
+              (std::vector<int32_t>{1}));
+    const auto& tables = binding_->model_params().multi_block_tables;
+    ASSERT_EQ(tables.size(), 3);
+    for (uint32_t manager = 0; manager < tables.size(); ++manager) {
+      EXPECT_EQ(tables[manager].data_ptr(), addresses[manager]);
+      EXPECT_TRUE(
+          torch::equal(tables[manager], torch::zeros({1, 1}, torch::kInt32)));
+    }
+    EXPECT_FALSE(binding_->sampling_params().selected_token_idxes.defined());
+    EXPECT_EQ(binding_->pinned_bytes(), pinned_bytes);
+  }
+  ASSERT_TRUE(prepare_model(make_forward_input({},
+                                               BatchForwardType::EMPTY,
+                                               /*actual_rows=*/0),
+                            *transfer_)
+                  .ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  EXPECT_EQ(binding_->model_params().meta.num_sequences, 0);
+  EXPECT_TRUE(binding_->model_params().attn_metadata->is_dummy);
+  ASSERT_EQ(binding_->model_params().multi_block_tables.size(), 3);
+  for (const auto& table : binding_->model_params().multi_block_tables) {
+    EXPECT_EQ(table.numel(), 0);
+  }
+  const auto reused = grouped_input();
+  ASSERT_TRUE(prepare_model(reused, *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  expect_tables(*binding_, reused.input_params.multi_block_tables);
+  EXPECT_FALSE(binding_->model_params().attn_metadata->is_dummy);
+  for (uint32_t manager = 0; manager < addresses.size(); ++manager) {
+    EXPECT_EQ(binding_->model_params().multi_block_tables[manager].data_ptr(),
+              addresses[manager]);
+  }
+}
+
+TEST_F(GroupedSlotBufferTest, InvalidGroupTablesLeavePriorSlotUnmodified) {
+  ASSERT_TRUE(prepare_model(grouped_input(), *transfer_).ok());
+  ASSERT_EQ(transfer_->synchronize(), 0);
+  const auto tables = clone_tables(*binding_);
+  const auto rejected = [this, &tables](const LlmForwardInput& input) {
+    expect_rejected(input);
+    expect_tables(*binding_, tables);
+  };
+  auto invalid = grouped_input();
+  invalid.input_params.multi_block_tables.pop_back();
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] = torch::Tensor();
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({1, 2}, torch::kInt32);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] = torch::zeros({2}, torch::kInt32);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({2, 1}, torch::kInt64);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({2, 1}, torch::kInt32).to(device_);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({2, 0}, torch::kInt32);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({2, 6}, torch::kInt32);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      torch::zeros({2, 4}, torch::kInt32)
+          .slice(/*dim=*/1,
+                 /*start=*/0,
+                 /*end=*/4,
+                 /*step=*/2);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1].fill_(-2);
+  rejected(invalid);
+  invalid = grouped_input();
+  invalid.input_params.multi_block_tables[1] =
+      binding_->model_params().multi_block_tables[1];
+  rejected(invalid);
+}
+
 TEST_F(SlotBufferTest, PrefillUsesFixedInputsAndUncachedLengths) {
   InputData input = make_input({3, 2}, {3, 2});
   const auto forward =

@@ -161,6 +161,41 @@ TEST_F(TaskExecutionPipelineInputTest, EmptyInputAndAbsentSamplingAreValid) {
 }
 
 TEST_F(TaskExecutionPipelineInputTest,
+       GroupedKvAcceptsHostTablesWithoutOrdinaryPagingFields) {
+  LlmTaskCapacity capacity;
+  capacity.model.num_block_managers = 3;
+  for (const BatchForwardType type : {BatchForwardType::PREFILL,
+                                      BatchForwardType::CHUNKED_PREFILL,
+                                      BatchForwardType::DECODE}) {
+    auto input = ordinary_input(/*num_tokens=*/1, type);
+    auto& params = input.input_params;
+    params.attention.host.block_tables = torch::Tensor();
+    params.attention.device.new_cache_slots = torch::Tensor();
+    params.multi_block_tables = {
+        torch::tensor({3, 4}, torch::kInt32).reshape({1, 2}),
+        torch::tensor({7}, torch::kInt32).reshape({1, 1}),
+        torch::tensor({8, 9, -1}, torch::kInt32).reshape({1, 3})};
+    EXPECT_TRUE(validate_input(input, capacity).ok());
+    EXPECT_FALSE(validate_input(input).ok());
+  }
+}
+
+TEST_F(TaskExecutionPipelineInputTest,
+       GroupedKvAcceptsEmptyDpPeerWithoutCacheTables) {
+  LlmTaskCapacity capacity;
+  capacity.model.num_block_managers = 3;
+  capacity.dp_size = 2;
+  capacity.dp_rank = 1;
+  LlmForwardInput empty;
+  empty.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  empty.input_params.parallel.dp_global_token_nums = {2, 0};
+  empty.input_params.parallel.dp_is_decode = {1, 0};
+  EXPECT_TRUE(validate_input(empty, capacity).ok());
+  empty.input_params.parallel.dp_global_token_nums = {0, 0};
+  EXPECT_TRUE(validate_input(empty, capacity).ok());
+}
+
+TEST_F(TaskExecutionPipelineInputTest,
        KvPushRequiresEnabledNonemptyServingPrefill) {
   auto source = ordinary_input();
   source.transfer_kv_infos.emplace_back();

@@ -2172,6 +2172,26 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
                     static_cast<uint32_t>(options.max_seqs_per_batch()),
                     static_cast<uint32_t>((positions + logical_block_size - 1) /
                                           logical_block_size)};
+  capacity.model.enable_linear_attention = has_linear_attention_layers(args);
+  if (args.model_type() == "deepseek_v4") {
+    if (args.window_size() <= 0) {
+      return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
+                            "Grouped KV requires a positive sliding window.");
+    }
+    capacity.model.num_block_managers = 1;
+    for (const int32_t ratio : {4, 128}) {
+      if (std::find(args.compress_ratios().begin(),
+                    args.compress_ratios().end(),
+                    ratio) != args.compress_ratios().end()) {
+        ++capacity.model.num_block_managers;
+      }
+    }
+    const int64_t swa_blocks =
+        (positions + args.window_size() - 1) / args.window_size();
+    capacity.model.max_blocks_per_sequence =
+        std::max(capacity.model.max_blocks_per_sequence,
+                 static_cast<uint32_t>(swa_blocks));
+  }
   capacity.max_kv_seq_len = static_cast<uint32_t>(positions);
   capacity.max_positions = static_cast<uint32_t>(positions);
   capacity.logical_block_size = static_cast<uint32_t>(logical_block_size);

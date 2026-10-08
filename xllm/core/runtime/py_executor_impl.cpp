@@ -311,11 +311,18 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
     kv_bound_ = true;
     kv_layer_count_ = num_layers;
     if (options_.enable_task_pipeline()) {
-      prepared_kv_bindings_.reserve(4 * kv_caches.size());
+      prepared_kv_bindings_.reserve(11 * kv_caches.size());
       for (const auto& kv : kv_caches) {
         prepared_kv_bindings_.emplace_back(kv.get_k_cache());
         prepared_kv_bindings_.emplace_back(kv.get_v_cache());
         prepared_kv_bindings_.emplace_back(kv.get_index_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_conv_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_ssm_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_swa_cache());
+        prepared_kv_bindings_.emplace_back(kv.get_compress_kv_state());
+        prepared_kv_bindings_.emplace_back(kv.get_compress_score_state());
+        prepared_kv_bindings_.emplace_back(kv.get_compress_index_kv_state());
+        prepared_kv_bindings_.emplace_back(kv.get_compress_index_score_state());
         prepared_kv_bindings_.emplace_back(
             kv.get_indexer_cache_scale().value_or(torch::Tensor()));
       }
@@ -330,6 +337,13 @@ void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
              {kv.get_k_cache(),
               kv.get_v_cache(),
               kv.get_index_cache(),
+              kv.get_conv_cache(),
+              kv.get_ssm_cache(),
+              kv.get_swa_cache(),
+              kv.get_compress_kv_state(),
+              kv.get_compress_score_state(),
+              kv.get_compress_index_kv_state(),
+              kv.get_compress_index_score_state(),
               kv.get_indexer_cache_scale().value_or(torch::Tensor())}) {
           const auto& bound = prepared_kv_bindings_[index++];
           CHECK_EQ(current.defined(), bound.defined())

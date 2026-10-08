@@ -157,6 +157,32 @@ def test_capture_and_replay_bind_each_slot_without_input_copies(runner: Prepared
     assert runner._capture.call_count == 4
 
 
+@pytest.mark.parametrize("field", ["linear_state_indices", "has_initial_state"])
+def test_prepared_graph_binds_recurrent_state_views(runner: PreparedAclGraphRunner, field: str) -> None:
+    tokens = torch.arange(2, dtype=torch.int32)
+    positions = torch.zeros_like(tokens)
+    metadata = _metadata(2)
+    metadata.q_cu_seq_lens = torch.tensor([0, 1, 2], dtype=torch.int32)
+    metadata.linear_state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    metadata.has_initial_state = torch.tensor([True, False])
+    runner.warmup_prepared(tokens, positions, metadata)
+    entry = runner._prepared_graphs[runner._prepared_binding(tokens, positions, metadata)]
+    assert entry.static_metadata.linear_state_indices is metadata.linear_state_indices
+    assert entry.static_metadata.has_initial_state is metadata.has_initial_state
+    assert entry.static_metadata.q_cu_seq_lens is metadata.q_cu_seq_lens
+    runner.execute(tokens, positions, metadata)
+    entry.graph.replay.assert_called_once()
+
+    original = getattr(metadata, field)
+    setattr(metadata, field, original.clone())
+    with pytest.raises(RuntimeError, match="warmed Slot binding"):
+        runner.execute(tokens, positions, metadata)
+    runner.warmup_prepared(tokens, positions, metadata)
+    second = runner._prepared_graphs[runner._prepared_binding(tokens, positions, metadata)]
+    assert second is not entry
+    assert getattr(entry.static_metadata, field) is original
+
+
 @pytest.mark.parametrize("prepared", [True, False], ids=["pipeline", "legacy"])
 @torch.inference_mode()
 def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(

@@ -328,6 +328,29 @@ class ModelExecutor:
         self.dp_size = dp_size
         self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
         self._prepared_block_draft = config.get("model_type") in ("DFlashDraftModel", "DFlash2DraftModel")
+        prepared_qwen35 = config.get("model_type") in (
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+        )
+        self._prepared_linear_state = prepared_qwen35 and any(
+            getattr(module, "layer_type", None) == "linear_attention" for module in model.modules()
+        )
+        ordinary_generation = (
+            config.get("task_type", "generate") == "generate"
+            and int(config.get("num_speculative_tokens", 0)) == 0
+            and num_decoding_tokens == 1
+            and not config.get("is_draft_engine", False)
+        )
+        # DeepSeek-V3.2 shares the GLM MLA/indexer metadata contract. Qwen3.5
+        # additionally carries recurrent-state Slot views. DeepSeek-V4 has its
+        # own compressed-cache metadata and currently executes eagerly.
+        prepared_ordinary_model = ordinary_generation and (
+            prepared_qwen35
+            or config.get("model_type") == "deepseek_v32"
+            or (config.get("model_type") == "deepseek_v4" and graph_backend in ("", "off", "none", "0"))
+        )
         prepared_kv_split = int(config.get("kv_split_size", 0)) or cp_size
         dcp_group = distributed.dcp_group(device) if current_platform.is_npu() else None
         dcp_size = dcp_group.size() if dcp_group is not None else 1
@@ -344,6 +367,7 @@ class ModelExecutor:
             self.attention_backend.supports_prepared_metadata
             and (
                 config.get("model_type") in ("qwen3", "glm_moe_dsa", "glm_moe_dsa_mtp")
+                or prepared_ordinary_model
                 or (self._prepared_block_draft and graph_backend in ("", "off", "none", "0"))
             )
             and prepared_kv
@@ -706,7 +730,24 @@ class ModelExecutor:
 
     def prepare_metadata(self, metadata: AttentionMetadata) -> None:
         if not self._supports_prepared_metadata or not self._kv_bound:
-            raise RuntimeError("prepared metadata requires an initialized supported Qwen3 or GLM executor")
+            raise RuntimeError("prepared metadata requires an initialized supported model executor")
+        if self._prepared_linear_state:
+            rows = metadata.q_seq_lens.numel()
+            for name, dtype, count in (
+                ("linear_state_indices", torch.int32, rows),
+                ("has_initial_state", torch.bool, rows),
+                ("q_cu_seq_lens", torch.int32, rows + 1),
+            ):
+                tensor = getattr(metadata, name, None)
+                if (
+                    tensor is None
+                    or tensor.ndim != 1
+                    or tensor.numel() != count
+                    or tensor.dtype != dtype
+                    or tensor.device != self.eager_runner.device
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(f"prepared Qwen3.5 requires a contiguous {name} Slot view with {count} entries")
         if self._prepared_block_draft:
             metadata.prepared_attention_state = self.attention_backend.prepare_metadata(
                 metadata, device_kv_lengths=True

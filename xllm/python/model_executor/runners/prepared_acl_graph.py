@@ -69,6 +69,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
             metadata.q_seq_lens,
             getattr(metadata, "q_cu_seq_lens", None),
             metadata.kv_seq_lens,
+            getattr(metadata, "linear_state_indices", None),
+            getattr(metadata, "has_initial_state", None),
             input_embedding,
             mtp_topk_indices,
         )
@@ -173,6 +175,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
             q_seq_lens=metadata.q_seq_lens,
             q_cu_seq_lens=metadata.q_cu_seq_lens,
             kv_seq_lens=metadata.kv_seq_lens,
+            linear_state_indices=getattr(metadata, "linear_state_indices", None),
+            has_initial_state=getattr(metadata, "has_initial_state", None),
             kv_seq_lens_host_values=list(metadata.kv_seq_lens_host_values),
             dp_execution_token_counts=tuple(getattr(metadata, "dp_execution_token_counts", ())),
             dp_is_decode=tuple(getattr(metadata, "dp_is_decode", ())),
